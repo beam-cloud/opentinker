@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from importlib.metadata import version
 from pathlib import Path
@@ -307,6 +308,12 @@ def test_on_demand_machine_is_reserved_and_released(monkeypatch: pytest.MonkeyPa
 
     def run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
         commands.append(command)
+        if "list" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"machines": [{"pool_name": "opentinker-test", "gpu": "A6000"}]}),
+                stderr="",
+            )
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setattr(beam_module.shutil, "which", lambda _name: "/usr/local/bin/beam")
@@ -328,15 +335,23 @@ def test_on_demand_machine_is_reserved_and_released(monkeypatch: pytest.MonkeyPa
         "prod3",
         "machine",
         "reserve",
-        "--gpu",
-        "A6000",
         "--nodes",
         "1",
         "--ttl",
         "45m",
         "--name",
         "opentinker-test",
-        "--yes",
+        "--gpu",
+        "A6000",
+    ]
+    assert commands[1][-7:] == [
+        "machine",
+        "list",
+        "--pool",
+        "opentinker-test",
+        "--no-offers",
+        "--format",
+        "json",
     ]
     assert pod_calls[0]["pool"] == "opentinker-test"
     assert pod_calls[0]["image"].build_calls == 1
@@ -344,7 +359,7 @@ def test_on_demand_machine_is_reserved_and_released(monkeypatch: pytest.MonkeyPa
 
     assert adapter.stop() is True
     assert instance.terminate_calls == 1
-    assert commands[1] == [
+    assert commands[2] == [
         "/usr/local/bin/beam",
         "--context",
         "prod3",
@@ -365,6 +380,12 @@ def test_on_demand_machine_releases_when_pod_creation_fails(
 
     def run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
         commands.append(command)
+        if "list" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"machines": [{"pool_name": "opentinker-test", "gpu": "A6000"}]}),
+                stderr="",
+            )
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setattr(beam_module.shutil, "which", lambda _name: "/usr/local/bin/beam")
@@ -375,11 +396,17 @@ def test_on_demand_machine_releases_when_pod_creation_fails(
             base_model="Qwen/Qwen3-0.6B",
             gpu="A6000",
             on_demand=True,
+            machine_name="opentinker-test",
         ).start(wait=False)
 
-    assert [command[3:5] for command in commands] == [
-        ["--gpu", "A6000"],
-        ["--pool", "opentinker-a6000"],
+    assert "reserve" in commands[0]
+    assert "list" in commands[1]
+    assert commands[2][-5:] == [
+        "machine",
+        "release",
+        "--pool",
+        "opentinker-test",
+        "--yes",
     ]
 
 
@@ -428,6 +455,7 @@ def test_interrupted_reservation_attempts_release(monkeypatch: pytest.MonkeyPatc
             profile="prod3",
             gpu="A16",
             on_demand=True,
+            machine_name="opentinker-test",
         ).start(wait=False)
 
     assert "reserve" in commands[0]
@@ -435,9 +463,82 @@ def test_interrupted_reservation_attempts_release(monkeypatch: pytest.MonkeyPatc
         "machine",
         "release",
         "--pool",
-        "opentinker-a16",
+        "opentinker-test",
         "--yes",
     ]
+
+
+def test_on_demand_without_gpu_uses_beam_picker_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, pod_calls, instance = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        commands.append(command)
+        if "list" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {"machines": [{"pool_name": "opentinker-picked", "gpu": "H100"}]}
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(beam_module.shutil, "which", lambda _name: "/usr/local/bin/beam")
+    monkeypatch.setattr(beam_module.subprocess, "run", run)
+
+    adapter = BeamComputeAdapter(
+        base_model="Qwen/Qwen3-0.6B",
+        gpu=None,
+        on_demand=True,
+        machine_name="opentinker-picked",
+    )
+    adapter.start(wait=False)
+
+    assert "--gpu" not in commands[0]
+    assert "--yes" not in commands[0]
+    assert adapter.gpu == "H100"
+    assert pod_calls[0]["gpu"] == "H100"
+    assert pod_calls[0]["pool"] == "opentinker-picked"
+    assert adapter.stop() is True
+    assert instance.terminate_calls == 1
+
+
+def test_cancelling_on_demand_picker_does_not_create_or_release_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, _, _ = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        commands.append(command)
+        if "list" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"machines": []}),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(beam_module.shutil, "which", lambda _name: "/usr/local/bin/beam")
+    monkeypatch.setattr(beam_module.subprocess, "run", run)
+
+    adapter = BeamComputeAdapter(
+        base_model="Qwen/Qwen3-0.6B",
+        on_demand=True,
+        machine_name="opentinker-cancelled",
+    )
+    with pytest.raises(RuntimeError, match="reservation was cancelled"):
+        adapter.start(wait=False)
+
+    assert len(commands) == 2
+    assert "reserve" in commands[0]
+    assert "list" in commands[1]
+    assert adapter.pool is None
 
 
 @pytest.mark.parametrize(

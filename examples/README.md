@@ -9,7 +9,6 @@ production acceptance test for OpenTinker.
 ```bash
 uv run python examples/cookbook_sl_loop.py \
   --profile default \
-  --gpu A10G \
   --steps 20 \
   --batch-size 4 \
   --max-length 1024 \
@@ -17,7 +16,18 @@ uv run python examples/cookbook_sl_loop.py \
 ```
 
 The recipe logs its normal NLL/BPB metrics and writes final state plus sampler
-checkpoints to `beam://tinker-checkpoints/checkpoints/...`.
+checkpoints to `beam://tinker-checkpoints/checkpoints/...`. It uses A10G
+serverless by default.
+
+Open Beam's native picker to choose from all current on-demand offers:
+
+```bash
+uv run python examples/cookbook_sl_loop.py \
+  --profile default --on-demand --steps 20
+```
+
+Use `--on-demand --gpu H100` to filter the picker. The selected machine is
+attached automatically and released when training exits.
 
 Evaluate the returned state checkpoint against held-out No Robots examples:
 
@@ -42,5 +52,6 @@ uv run python examples/basic_finetune.py \
   --profile default --gpu A10G --steps 4
 ```
 
-For an on-demand machine, choose a GPU offered by `beam machine list` and add
-`--on-demand`. The adapter releases reservations and Pods on context exit.
+For an on-demand machine, add `--on-demand` to browse all offers or combine it
+with `--gpu` to filter them. The adapter releases reservations and Pods on
+context exit.

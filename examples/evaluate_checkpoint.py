@@ -20,9 +20,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("checkpoint", help="beam:// Volume URI returned by save_state")
     parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--profile")
-    parser.add_argument("--gpu", default="A10G")
+    parser.add_argument(
+        "--gpu",
+        help="GPU type (default: A10G serverless; omit with --on-demand to browse all)",
+    )
     parser.add_argument("--pool")
-    parser.add_argument("--on-demand", action="store_true")
+    parser.add_argument(
+        "--on-demand",
+        action="store_true",
+        help="open Beam's machine picker and release the reservation after evaluation",
+    )
+    parser.add_argument("--machine-ttl", default="1h")
     parser.add_argument("--examples", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument(
@@ -64,6 +72,7 @@ def main() -> None:
         gpu=args.gpu,
         pool=args.pool,
         on_demand=args.on_demand,
+        machine_ttl=args.machine_ttl,
         sampling_gpu=False,
         max_length=args.max_length,
     )

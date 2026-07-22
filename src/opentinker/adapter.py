@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import json
 import logging
 import os
 import shlex
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +67,10 @@ class BeamComputeAdapter:
     any ``ServiceClient()`` created inside the context to the same backend, so
     existing Tinker Cookbook entrypoints can run without recipe changes.
 
+    With no GPU configuration, serverless mode defaults to A10G and on-demand
+    mode opens Beam's hardware picker. A concrete on-demand ``gpu`` filters
+    that picker to one GPU family.
+
     The first implementation is intentionally single-node. One GPU trains a
     PEFT LoRA adapter; sampling can share it or use a second GPU.
     """
@@ -73,7 +79,7 @@ class BeamComputeAdapter:
     provider: ProviderName = "beam"
     profile: str | None = None
 
-    gpu: str | Sequence[str] = "A10G"
+    gpu: str | Sequence[str] | None = None
     sampling_gpu: bool = False
     cpu: int | float | str = 4
     memory: int | str = "16Gi"
@@ -125,7 +131,10 @@ class BeamComputeAdapter:
             raise ValueError("base_model must be a non-empty string")
         if self.profile is not None and not self.profile.strip():
             raise ValueError("profile must be non-empty or None")
-        if isinstance(self.gpu, str):
+        if self.gpu is None:
+            if not self.on_demand:
+                self.gpu = "A10G"
+        elif isinstance(self.gpu, str):
             if not self.gpu.strip():
                 raise ValueError("gpu must be a non-empty resource value")
         else:
@@ -150,8 +159,8 @@ class BeamComputeAdapter:
             raise ValueError("machine_ttl must be non-empty")
         if self.machine_name is not None and not self.machine_name.strip():
             raise ValueError("machine_name must be non-empty or None")
-        if self.on_demand and not isinstance(self.gpu, str):
-            raise ValueError("on_demand requires one concrete GPU type")
+        if self.on_demand and self.gpu is not None and not isinstance(self.gpu, str):
+            raise ValueError("on_demand accepts one GPU type or None for Beam's hardware picker")
         if self.on_demand and self.sampling_gpu:
             raise ValueError("on_demand currently requires sampling_gpu=False")
         if not self.volume_name.strip():
@@ -205,6 +214,8 @@ class BeamComputeAdapter:
             if not build_result.success:
                 raise RuntimeError("failed to build Beam/Beta9 image")
             self._reserve_machine()
+        if self.gpu is None:
+            raise RuntimeError("no GPU was selected for the Beam/Beta9 Pod")
         primary_volume = self.volume
         if primary_volume is None:
             try:
@@ -453,38 +464,96 @@ class BeamComputeAdapter:
         return command
 
     def _reserve_machine(self) -> None:
-        assert isinstance(self.gpu, str)
+        assert self.gpu is None or isinstance(self.gpu, str)
         if self._reserved_pool is not None:
             raise RuntimeError("this adapter already owns an on-demand machine")
-        pool = self.pool or self.machine_name or f"opentinker-{self.gpu.lower()}"
-        command = self._machine_command(
+        requested_gpu = self.gpu
+        original_pool = self.pool
+        gpu_label = requested_gpu.lower() if requested_gpu is not None else "ondemand"
+        pool = self.pool or self.machine_name or f"opentinker-{gpu_label}-{uuid.uuid4().hex[:8]}"
+        arguments = [
             "machine",
             "reserve",
-            "--gpu",
-            self.gpu,
             "--nodes",
             "1",
             "--ttl",
             self.machine_ttl,
             "--name",
             pool,
-            "--yes",
-        )
+        ]
+        if requested_gpu is not None:
+            arguments.extend(["--gpu", requested_gpu])
+        command = self._machine_command(*arguments)
+        self.pool = pool
+        self._reserved_pool = pool
         try:
-            result = subprocess.run(command, check=False, capture_output=True, text=True)
+            # Inherit the terminal streams. Beam opens its native offer picker
+            # when interactive and selects the cheapest offer when headless.
+            result = subprocess.run(command, check=False)
         except BaseException:
             # The reservation RPC may have succeeded before the local wait was
             # interrupted. Record ownership first so cleanup always attempts a release.
-            self.pool = pool
-            self._reserved_pool = pool
             self._release_reserved_machine()
             raise
         if result.returncode != 0:
+            self._release_reserved_machine()
+            raise RuntimeError("failed to reserve an on-demand machine; see Beam's output above")
+
+        try:
+            selected_gpu = self._reserved_machine_gpu(pool)
+        except BaseException:
+            self._release_reserved_machine()
+            raise
+        if selected_gpu is None:
+            # A declined interactive confirmation exits successfully without
+            # creating a pool. There is nothing to release in that case.
+            self._reserved_pool = None
+            self.pool = original_pool
+            raise RuntimeError("on-demand reservation was cancelled; no machine was created")
+        if requested_gpu is not None and selected_gpu != requested_gpu:
+            self._release_reserved_machine()
+            raise RuntimeError(
+                f"Beam reserved {selected_gpu}, but OpenTinker requested {requested_gpu}"
+            )
+        self.gpu = selected_gpu
+        logger.info("Reserved on-demand Beam pool %s with %s", pool, selected_gpu)
+
+    def _reserved_machine_gpu(self, pool: str) -> str | None:
+        command = self._machine_command(
+            "machine",
+            "list",
+            "--pool",
+            pool,
+            "--no-offers",
+            "--format",
+            "json",
+        )
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(f"failed to reserve on-demand machine: {detail}")
-        self.pool = pool
-        self._reserved_pool = pool
-        logger.info("Reserved on-demand Beam pool %s", pool)
+            raise RuntimeError(f"could not inspect reserved Beam pool {pool!r}: {detail}")
+        try:
+            payload = json.loads(result.stdout)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "Beam returned invalid JSON while inspecting the reservation"
+            ) from exc
+        machines = payload.get("machines")
+        if not isinstance(machines, list):
+            raise RuntimeError("Beam's machine list response did not contain a machine list")
+        matched_machines = [
+            machine
+            for machine in machines
+            if isinstance(machine, dict) and machine.get("pool_name") == pool
+        ]
+        if not matched_machines:
+            return None
+        gpus = {str(machine.get("gpu")) for machine in matched_machines if machine.get("gpu")}
+        if not gpus:
+            raise RuntimeError("OpenTinker requires a GPU, but the selected machine is CPU-only")
+        if len(gpus) != 1:
+            raise RuntimeError(f"reserved Beam pool {pool!r} contains multiple GPU types")
+        return gpus.pop()
 
     def _release_reserved_machine(self) -> bool:
         pool = self._reserved_pool

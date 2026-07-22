@@ -45,9 +45,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--renderer", default="qwen3")
     parser.add_argument("--provider", choices=("beam", "beta9"), default="beam")
     parser.add_argument("--profile")
-    parser.add_argument("--gpu", default="A10G")
+    parser.add_argument(
+        "--gpu",
+        help="GPU type (default: A10G serverless; omit with --on-demand to browse all)",
+    )
     parser.add_argument("--pool")
-    parser.add_argument("--on-demand", action="store_true")
+    parser.add_argument(
+        "--on-demand",
+        action="store_true",
+        help="open Beam's machine picker and release the reservation after training",
+    )
     parser.add_argument("--machine-ttl", default="1h")
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=2e-3)
@@ -93,7 +100,7 @@ def main() -> None:
     with adapter as service_client:
         print(
             f"Beam backend ready: {adapter.endpoint_url} "
-            f"(gpu={args.gpu}, volume={adapter.volume_name})",
+            f"(gpu={adapter.gpu}, volume={adapter.volume_name})",
             flush=True,
         )
         training_client = service_client.create_lora_training_client(
@@ -138,7 +145,7 @@ def main() -> None:
 
     summary = {
         "model": args.model,
-        "gpu": args.gpu,
+        "gpu": adapter.gpu,
         "steps": args.steps,
         "initial_nll": initial,
         "training_nll": step_losses,

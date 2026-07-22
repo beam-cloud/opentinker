@@ -43,24 +43,42 @@ sampler checkpoints to a Beam Volume.
 ```bash
 uv run python examples/cookbook_sl_loop.py \
   --profile default \
-  --gpu A10G \
   --steps 20 \
   --batch-size 4 \
   --max-length 1024 \
   --log-path ./runs/no-robots
 ```
 
-`A10G` uses Beam's serverless pool when it is available. To reserve supported
-on-demand hardware instead, select an offered GPU and add `--on-demand`:
+With no compute flags, OpenTinker requests an A10G from Beam's serverless pool.
+
+## Choose any on-demand GPU interactively
+
+Add `--on-demand` without a GPU to open Beam's native hardware picker inside
+the training command:
 
 ```bash
 uv run python examples/cookbook_sl_loop.py \
-  --profile default --gpu A16 --on-demand --steps 20
+  --profile default --on-demand --steps 20
 ```
 
-The on-demand reservation has a one-hour safety TTL and is released when the
-adapter exits. You can also pass `--pool your-existing-pool` without
-`--on-demand`.
+The picker shows every currently available offer with its GPU count, region,
+hourly price, and provider. After you confirm an offer, OpenTinker discovers
+the selected GPU, binds the training Pod to the new pool, and releases the
+machine when the adapter exits. The image is built before the picker opens, so
+paid hardware is not held during image construction.
+
+Filter the picker when you already know the GPU family you want:
+
+```bash
+uv run python examples/cookbook_sl_loop.py \
+  --profile default --on-demand --gpu H100 --steps 20
+```
+
+Reservations have a one-hour safety TTL by default; change it with
+`--machine-ttl 6h`. In a headless process the Beam CLI selects the cheapest
+matching offer without prompting, so pass `--gpu` for deterministic automation.
+You can also use an existing private pool with `--pool your-existing-pool`
+without `--on-demand`.
 
 ## Use the Cookbook recipe in your own code
 
@@ -94,6 +112,18 @@ with BeamComputeAdapter(
 The recipe creates its own `tinker.ServiceClient()`. While the adapter context
 is active, that client is transparently routed to the Beam backend. No recipe
 fork is required.
+
+The Python API has the same interactive path. Leaving `gpu` unset while using
+`on_demand=True` opens the unfiltered Beam picker:
+
+```python
+with BeamComputeAdapter(
+    base_model="Qwen/Qwen3-4B-Instruct-2507",
+    profile="default",
+    on_demand=True,
+) as service_client:
+    ...
+```
 
 ## Checkpoints are Beam Volume paths
 

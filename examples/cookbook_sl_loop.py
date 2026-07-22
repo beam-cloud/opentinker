@@ -16,9 +16,17 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--provider", choices=("beam", "beta9"), default="beam")
     parser.add_argument("--profile")
-    parser.add_argument("--gpu", default="A10G")
+    parser.add_argument(
+        "--gpu",
+        help="GPU type (default: A10G serverless; omit with --on-demand to browse all)",
+    )
     parser.add_argument("--pool")
-    parser.add_argument("--on-demand", action="store_true")
+    parser.add_argument(
+        "--on-demand",
+        action="store_true",
+        help="open Beam's machine picker and release the reservation after training",
+    )
+    parser.add_argument("--machine-ttl", default="1h")
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=512)
@@ -36,6 +44,7 @@ def main() -> None:
         gpu=args.gpu,
         pool=args.pool,
         on_demand=args.on_demand,
+        machine_ttl=args.machine_ttl,
         volume_name=args.volume_name,
         sampling_gpu=False,
         max_length=args.max_length,
@@ -45,7 +54,7 @@ def main() -> None:
             "Running the upstream Tinker Cookbook supervised loop\n"
             "dataset=HuggingFaceH4/no_robots\n"
             f"model={args.model}\n"
-            f"gpu={args.gpu}\n"
+            f"gpu={adapter.gpu}\n"
             f"steps={args.steps}\n"
             f"batch_size={args.batch_size}\n"
             f"checkpoint_volume=beam://{args.volume_name}/checkpoints",
