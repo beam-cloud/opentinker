@@ -443,6 +443,7 @@ def test_builds_owned_backend_image(monkeypatch: pytest.MonkeyPatch) -> None:
         "Dockerfile",
         "opentinker/__init__.py",
         "opentinker/_api.py",
+        "opentinker/_distillation.py",
         "opentinker/_engine.py",
         "opentinker/_examples.py",
         "opentinker/_server.py",

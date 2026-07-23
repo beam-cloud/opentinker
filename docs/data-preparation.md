@@ -145,7 +145,7 @@ teacher answer, then train the student on that answer. Persist the boundary as
 JSONL so the exact teacher dataset is auditable:
 
 ```json
-{"prompt":"Read orders.csv and produce a six-step tool plan.","teacher_response":"{\"calls\":[...]}","verified":true,"teacher":"Qwen/Qwen3-4B-Instruct-2507"}
+{"prompt":"Customer message: cash transfer is pending","teacher_response":"{\"intent\":\"pending_transfer\",\"queue\":\"bank_transfers\",\"priority\":\"P2\"}","verified":true,"teacher":"Qwen/Qwen3-14B"}
 ```
 
 Convert verified rows into student datums:
@@ -158,7 +158,7 @@ student_datums = distillation_records_to_datums(
     teacher_rows,
     renderer=student_renderer,
     max_length=2048,
-    instruction="Compile this request into JSON. Return JSON only.",
+    instruction="Route this request. Return intent, queue, and priority as JSON.",
     require_verified=True,
 )
 ```
@@ -172,15 +172,17 @@ The helper constructs this student conversation for every row:
 Only the assistant teacher response receives loss. `require_verified=True`
 fails before training if any row is not explicitly marked `verified: true`.
 
-The full [`distill_tool_planner.py`](../examples/distill_tool_planner.py)
-example keeps these boundaries explicit:
+The full [`distill_support_router.py`](../examples/distill_support_router.py)
+example applies these boundaries to the real Banking77 train/test splits:
 
-- the teacher receives a detailed schema/tool contract;
+- the teacher receives a detailed 16-intent support policy;
 - the smaller student receives only the short instruction and user request;
-- an exact semantic verifier rejects malformed or incorrect teacher outputs;
+- an exact verifier rejects malformed or policy-inconsistent teacher outputs;
 - verified teacher rows are written with `write_jsonl` before training;
-- held-out scenarios never enter the teacher training file;
-- the saved student checkpoint is reloaded and evaluated independently.
+- held-out test tickets never enter the teacher training file;
+- base, teacher, and checkpoint inference are scored on the same test rows.
+
+See [Practical distillation](distillation.md) for the complete worked example.
 
 For probabilistic tasks, replace exact equality with a task-specific verifier,
 reward threshold, unit test, schema validator, or human approval step. Do not

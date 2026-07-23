@@ -187,10 +187,11 @@ flowchart TD
    client, ideally on a new machine, and score only unseen prompts. Compare it
    with the untouched student and teacher so the transfer is measurable.
 
-The runnable [`distill_tool_planner.py`](../examples/distill_tool_planner.py)
-uses an exact six-call tool-plan verifier. Its verified prod3 run measured base
-student `0/6`, teacher `6/6`, distilled student `6/6`, and a second-machine
-checkpoint evaluation of `6/6`.
+The runnable
+[`distill_support_router.py`](../examples/distill_support_router.py) uses the
+real Banking77 train/test splits and an exact support-policy verifier. See
+[Practical distillation](distillation.md) for its data contract and inference
+A/B design.
 
 ## Fine-tuning versus distillation
 

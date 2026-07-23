@@ -5,18 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
-import tinker
 from tinker_cookbook import renderers
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from opentinker import BeamComputeAdapter
-from opentinker._examples import add_compute_arguments, compute_options_from_args, mean_nll
+from opentinker._distillation import extract_json_object, sample_text, train_lora
+from opentinker._examples import add_compute_arguments, compute_options_from_args
 from opentinker.data import distillation_records_to_datums, write_jsonl
 
 TEACHER_SYSTEM_PROMPT = """You are a workflow compiler. Convert the user's analytics request into
@@ -194,37 +193,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def extract_plan(text: str) -> dict[str, Any] | None:
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(text):
-        if character != "{":
-            continue
-        try:
-            value, _end = decoder.raw_decode(text[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict) and isinstance(value.get("calls"), list):
-            return cast(dict[str, Any], value)
-    return None
-
-
-def sample_text(
-    client: Any,
-    renderer: Any,
-    tokenizer: Any,
-    messages: list[dict[str, str]],
-    max_tokens: int,
-) -> str:
-    prompt = renderer.build_generation_prompt(cast(Any, messages))
-    response = client.sample(
-        prompt=prompt,
-        sampling_params=tinker.SamplingParams(
-            max_tokens=max_tokens,
-            temperature=0.0,
-            stop=renderer.get_stop_sequences(),
-        ),
-        num_samples=1,
-    ).result()
-    return tokenizer.decode(response.sequences[0].tokens, skip_special_tokens=True)
+    value = extract_json_object(text)
+    return value if value is not None and isinstance(value.get("calls"), list) else None
 
 
 def student_messages(scenario: Scenario) -> list[dict[str, str]]:
@@ -261,7 +231,7 @@ def evaluate(
             renderer,
             tokenizer,
             messages,
-            max_tokens,
+            max_tokens=max_tokens,
         )
         parsed = extract_plan(response)
         passed = parsed == scenario.plan
@@ -358,7 +328,7 @@ def main() -> None:
                     {"role": "system", "content": TEACHER_SYSTEM_PROMPT},
                     {"role": "user", "content": scenario.request},
                 ],
-                args.max_output_tokens,
+                max_tokens=args.max_output_tokens,
             )
             plan = extract_plan(raw)
             accepted = plan == scenario.plan
@@ -402,46 +372,19 @@ def main() -> None:
             instruction=STUDENT_INSTRUCTION,
             require_verified=True,
         )
-        training_client = service_client.create_lora_training_client(
+        checkpoint_name = f"tool-planner-{int(time.time())}"
+        training = train_lora(
+            service_client,
             base_model=args.student,
+            datums=datums,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            checkpoint_name=checkpoint_name,
             rank=8,
             seed=0,
         )
-        rng = random.Random(0)
-        total_steps = args.epochs * math.ceil(len(datums) / args.batch_size)
-        step = 0
-        training_losses: list[float] = []
-        for epoch in range(args.epochs):
-            epoch_datums = list(datums)
-            rng.shuffle(epoch_datums)
-            for offset in range(0, len(epoch_datums), args.batch_size):
-                batch = epoch_datums[offset : offset + args.batch_size]
-                step += 1
-                forward_backward = training_client.forward_backward(
-                    batch,
-                    loss_fn="cross_entropy",
-                )
-                optimizer = training_client.optim_step(
-                    tinker.AdamParams(
-                        learning_rate=args.learning_rate,
-                        beta1=0.9,
-                        beta2=0.95,
-                        eps=1e-8,
-                    )
-                )
-                loss = mean_nll(forward_backward.result(), batch)
-                optimizer.result()
-                training_losses.append(loss)
-                print(
-                    f"epoch={epoch + 1}/{args.epochs} step={step}/{total_steps} "
-                    f"teacher_ce_nll={loss:.6f}",
-                    flush=True,
-                )
-
-        checkpoint_name = f"tool-planner-{int(time.time())}"
-        state_path = training_client.save_state(checkpoint_name).result().path
-        sampler_path = training_client.save_weights_for_sampler(checkpoint_name).result().path
-        tuned_client = service_client.create_sampling_client(model_path=sampler_path)
+        tuned_client = service_client.create_sampling_client(model_path=training.sampler_checkpoint)
         distilled = evaluate(
             "distilled_student",
             tuned_client,
@@ -460,10 +403,10 @@ def main() -> None:
         "teacher": teacher_eval,
         "base_student": baseline,
         "distilled_student": distilled,
-        "training_initial_nll": training_losses[0],
-        "training_final_nll": training_losses[-1],
-        "state_checkpoint": state_path,
-        "sampler_checkpoint": sampler_path,
+        "training_initial_nll": training.losses[0],
+        "training_final_nll": training.losses[-1],
+        "state_checkpoint": training.state_checkpoint,
+        "sampler_checkpoint": training.sampler_checkpoint,
         "teacher_dataset": str(dataset_path),
         "container_id": adapter.container_id,
         "dashboard_url": adapter.dashboard_url,
