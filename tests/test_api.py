@@ -60,6 +60,13 @@ class ContractEngine:
     def create_sampling_session(self, request: dict[str, Any]) -> dict[str, Any]:
         return {"type": "create_sampling_session", "sampling_session_id": "sampler-1"}
 
+    def get_sampler(self, sampling_session_id: str) -> dict[str, Any]:
+        return {
+            "sampler_id": sampling_session_id,
+            "base_model": self.base_model,
+            "model_path": None,
+        }
+
     def sample(self, request: dict[str, Any]) -> dict[str, Any]:
         return {
             "type": "sample",
@@ -184,6 +191,16 @@ async def test_owned_server_implements_tinker_contract() -> None:
             json={"session_id": session["session_id"], "base_model": "Qwen/Qwen3-0.6B"},
         )
     ).json()
+    sampler = (
+        await client.get(
+            f"/api/v1/samplers/{sampling_session['sampling_session_id']}",
+        )
+    ).json()
+    assert sampler == {
+        "sampler_id": "sampler-1",
+        "base_model": "Qwen/Qwen3-0.6B",
+        "model_path": None,
+    }
     sample = await retrieve(
         client,
         (

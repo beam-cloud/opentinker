@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from importlib.metadata import version
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -12,6 +13,7 @@ import tinker
 
 from opentinker import _image as image_module
 from opentinker import adapter as beam_module
+from opentinker import notebook as notebook_module
 from opentinker._hardware import HardwareManager
 from opentinker.adapter import BeamComputeAdapter
 
@@ -19,6 +21,7 @@ from opentinker.adapter import BeamComputeAdapter
 class FakeImage:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
+        self.python_version = "python3"
         self.override_python_version = False
         self.ignore_python = False
         self.build_calls = 0
@@ -123,9 +126,7 @@ def patch_adapter_dependencies(
     monkeypatch.setattr(BeamComputeAdapter, "_load_provider", lambda _self: provider)
     monkeypatch.setattr(BeamComputeAdapter, "_prepare_volume_shutdown", lambda *_args: True)
     monkeypatch.setattr(BeamComputeAdapter, "_finish_remote", lambda *_args: True)
-    monkeypatch.setattr(
-        BeamComputeAdapter, "_wait_for_task_completion", lambda *_args: "COMPLETE"
-    )
+    monkeypatch.setattr(BeamComputeAdapter, "_wait_for_task_completion", lambda *_args: "COMPLETE")
     return clients
 
 
@@ -170,6 +171,7 @@ def test_starts_backend_and_returns_normal_client(
     assert options["pool"] == "training"
     assert options["configured_pool_fallback"] == "wait"
     assert options["allow_marketplace"] is True
+    assert options["keep_warm_seconds"] == 3600
     assert options["secrets"] == ["HF_TOKEN"]
     assert options["env"] == {
         "OPENTINKER_BASE_MODEL": "Qwen/Qwen3-8B",
@@ -335,6 +337,10 @@ def test_context_scopes_cookbook_created_service_clients(
 
         def __init__(self, **kwargs: Any) -> None:
             holder_calls.append(kwargs)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
 
     monkeypatch.setattr(
         "tinker.lib.public_interfaces.service_client.InternalClientHolder",
@@ -350,6 +356,197 @@ def test_context_scopes_cookbook_created_service_clients(
     assert holder_calls[0]["default_headers"]["Authorization"] == "Bearer provider-token"
     assert holder_calls[0]["user_metadata"] == {"recipe": "grpo"}
     assert instance.terminate_calls == 0
+
+
+def test_notebook_lifecycle_routes_clients_and_restores_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, pod_calls, instance = fake_provider()
+    clients = patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(BeamComputeAdapter, "_wait_until_ready", lambda *_: None)
+    monkeypatch.delenv("TINKER_API_KEY", raising=False)
+    original_service_client = tinker.ServiceClient
+    holder_calls: list[dict[str, Any]] = []
+    routed_holders: list[Any] = []
+
+    class CookbookHolder:
+        _session_id = "session"
+
+        def __init__(self, **kwargs: Any) -> None:
+            holder_calls.append(kwargs)
+            self.close_calls = 0
+            routed_holders.append(self)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setattr(
+        "tinker.lib.public_interfaces.service_client.InternalClientHolder",
+        CookbookHolder,
+    )
+
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B")
+    assert adapter.start_notebook(wait=False) is adapter
+    assert adapter.start_notebook(wait=False) is adapter
+    assert len(pod_calls) == 1
+    assert os.environ["TINKER_API_KEY"] == "tml-beam-compute"
+
+    _ = tinker.ServiceClient(user_metadata={"recipe": "sl_loop"}).holder
+
+    assert holder_calls[0]["base_url"] == "https://pod.example.test"
+    assert holder_calls[0]["api_key"] == "tml-beam-compute"
+    assert holder_calls[0]["default_headers"]["Authorization"] == "Bearer provider-token"
+    assert adapter.finish() is True
+    assert tinker.ServiceClient is original_service_client
+    assert "TINKER_API_KEY" not in os.environ
+    assert clients[0].holder.close_calls == 1
+    assert routed_holders[0].close_calls == 1
+    assert adapter._routed_clients == []
+    assert instance.terminate_calls == 0
+
+
+def test_notebook_api_key_restore_preserves_user_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, _, _ = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(BeamComputeAdapter, "_wait_until_ready", lambda *_: None)
+    monkeypatch.setenv("TINKER_API_KEY", "")
+
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B").start_notebook(wait=False)
+    assert os.environ["TINKER_API_KEY"] == "tml-beam-compute"
+    os.environ["TINKER_API_KEY"] = "tml-user-replaced-key"
+
+    assert adapter.stop() is True
+    assert os.environ["TINKER_API_KEY"] == "tml-user-replaced-key"
+
+
+def test_notebook_rerun_reports_an_unreachable_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, pod_calls, _ = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(BeamComputeAdapter, "_wait_until_ready", lambda *_: None)
+
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B").start_notebook()
+    monkeypatch.setattr(adapter, "_notebook_backend_is_healthy", lambda: False)
+
+    with pytest.raises(RuntimeError, match="did not respond to repeated health checks"):
+        adapter.start_notebook()
+
+    assert len(pod_calls) == 1
+    assert adapter.stop() is True
+
+
+def test_notebook_health_check_retries_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, _, _ = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(BeamComputeAdapter, "_wait_until_ready", lambda *_: None)
+    responses = [
+        httpx.Response(503, text="temporarily unavailable"),
+        httpx.Response(200, json={"status": "ok"}),
+    ]
+    sleeps: list[float] = []
+
+    def get(url: str, *, headers: dict[str, str], timeout: int) -> httpx.Response:
+        assert url == "https://pod.example.test/api/v1/healthz"
+        assert headers == {"Authorization": "Bearer provider-token"}
+        assert timeout == 3
+        return responses.pop(0)
+
+    monkeypatch.setattr(beam_module.httpx, "get", get)
+    monkeypatch.setattr(beam_module.time, "sleep", sleeps.append)
+
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B").start_notebook(wait=False)
+
+    assert adapter.start_notebook() is adapter
+    assert sleeps == [1]
+    assert adapter.stop() is True
+
+
+def test_notebook_kernel_exit_stops_backend_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, _, instance = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(BeamComputeAdapter, "_wait_until_ready", lambda *_: None)
+    callbacks: list[Any] = []
+    unregistered: list[Any] = []
+    monkeypatch.setattr(
+        beam_module.atexit,
+        "register",
+        lambda callback: callbacks.append(callback) or callback,
+    )
+    monkeypatch.setattr(
+        beam_module.atexit,
+        "unregister",
+        lambda callback: unregistered.append(callback),
+    )
+
+    BeamComputeAdapter(base_model="Qwen/Qwen3-8B").start_notebook(wait=False)
+
+    assert len(callbacks) == 1
+    callbacks[0]()
+    callbacks[0]()
+    assert instance.terminate_calls == 1
+    assert unregistered == callbacks
+
+
+def test_notebook_helpers_reuse_exact_rerun_and_reject_changed_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, pod_calls, instance = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(BeamComputeAdapter, "_wait_until_ready", lambda *_: None)
+    monkeypatch.delenv("TINKER_API_KEY", raising=False)
+    monkeypatch.setattr(notebook_module, "_active_adapter", None)
+    monkeypatch.setattr(notebook_module, "_active_signature", None)
+
+    first = notebook_module.start(
+        base_model="Qwen/Qwen3-8B",
+        profile="prod3",
+        wait=False,
+    )
+    rerun = notebook_module.start(
+        base_model="Qwen/Qwen3-8B",
+        profile="prod3",
+        wait=False,
+    )
+
+    assert rerun is first
+    assert len(pod_calls) == 1
+    with pytest.raises(RuntimeError, match="different OpenTinker notebook session"):
+        notebook_module.start(
+            base_model="Qwen/Qwen3-14B",
+            profile="prod3",
+            wait=False,
+        )
+    assert len(pod_calls) == 1
+
+    assert notebook_module.stop() is True
+    assert instance.terminate_calls == 1
+    assert "TINKER_API_KEY" not in os.environ
+    assert notebook_module.stop() is True
+
+
+def test_notebook_finish_gracefully_completes_active_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, _, instance = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(BeamComputeAdapter, "_wait_until_ready", lambda *_: None)
+    monkeypatch.delenv("TINKER_API_KEY", raising=False)
+    monkeypatch.setattr(notebook_module, "_active_adapter", None)
+    monkeypatch.setattr(notebook_module, "_active_signature", None)
+
+    notebook_module.start(base_model="Qwen/Qwen3-8B", wait=False)
+
+    assert notebook_module.finish() is True
+    assert instance.terminate_calls == 0
+    assert "TINKER_API_KEY" not in os.environ
+    assert notebook_module.finish() is True
 
 
 def test_builds_owned_backend_image(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -369,8 +566,8 @@ def test_builds_owned_backend_image(monkeypatch: pytest.MonkeyPatch) -> None:
         "FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime\n"
         "RUN python -m pip install --no-cache-dir tinker==9.9.9"
     )
-    assert "'peft>=0.18,<0.19'" in dockerfile
-    assert "'transformers>=4.57.6,<5'" in dockerfile
+    assert "'peft>=0.18.1,<0.19'" in dockerfile
+    assert "transformers==5.5.4" in dockerfile
     assert "'fastapi>=0.115,<1'" in dockerfile
     assert "'uvicorn[standard]>=0.34,<1'" in dockerfile
     assert " flash-attn\n" in dockerfile
@@ -393,9 +590,33 @@ def test_builds_owned_backend_image(monkeypatch: pytest.MonkeyPatch) -> None:
         "opentinker/_server.py",
         "opentinker/adapter.py",
         "opentinker/data.py",
+        "opentinker/notebook.py",
         "opentinker/py.typed",
     ]
     assert image.kwargs["context_mtimes"] == {image_module._REPRODUCIBLE_MTIME}
+    assert image.ignore_python is True
+
+
+def test_notebook_image_handles_sdk_string_version_without_overriding_dockerfile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, pod_calls, _ = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(image_module, "_is_notebook_process", lambda: True)
+    fake_sdk_image_module = image_module.sys.modules[FakeImage.__module__]
+    monkeypatch.setattr(
+        fake_sdk_image_module,
+        "LOCAL_PYTHON_VERSION",
+        "python3.13",
+        raising=False,
+    )
+
+    BeamComputeAdapter(base_model="Qwen/Qwen3.5-4B").start(wait=False)
+
+    image = pod_calls[0]["image"]
+    assert image.python_version == "python3"
+    assert image.ignore_python is True
+    assert fake_sdk_image_module.LOCAL_PYTHON_VERSION.value == "python3.13"
 
 
 def test_default_image_uses_running_tinker_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -537,6 +758,40 @@ def test_graceful_finish_does_not_cancel_when_status_observation_fails(
     assert adapter.finish() is False
     assert instance.terminate_calls == 0
     assert released is False
+
+
+def test_graceful_finish_closes_every_routed_client_before_remote_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B")
+    adapter._instance = FakePodInstance()
+    adapter._client = cast(Any, FakeServiceClient(name="adapter"))
+    adapter._routed_clients = cast(
+        Any,
+        [FakeServiceClient(name="cookbook-1"), FakeServiceClient(name="cookbook-2")],
+    )
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        adapter,
+        "_close_client",
+        lambda client: events.append(f"close:{client.kwargs['name']}"),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_finish_remote",
+        lambda _instance: events.append("finish") or True,
+    )
+    monkeypatch.setattr(adapter, "_wait_for_task_completion", lambda _instance: "COMPLETE")
+
+    assert adapter.finish() is True
+    assert events == [
+        "close:cookbook-1",
+        "close:cookbook-2",
+        "close:adapter",
+        "finish",
+    ]
+    assert adapter._routed_clients == []
 
 
 def test_wait_for_task_completion_uses_profiled_gateway(
@@ -1003,6 +1258,8 @@ def test_cancelling_on_demand_picker_does_not_create_or_release_pool(
         ({"port": 0}, "port"),
         ({"wait_timeout": 0}, "wait_timeout"),
         ({"poll_interval": 0}, "poll_interval"),
+        ({"keep_warm_seconds": 0}, "keep_warm_seconds"),
+        ({"keep_warm_seconds": -1}, "keep_warm_seconds"),
         ({"env": {"TOKEN": 1}}, "env"),
         ({"tinker_requirement": ""}, "tinker_requirement"),
         ({"on_demand": True, "pool": "existing"}, "mutually exclusive"),

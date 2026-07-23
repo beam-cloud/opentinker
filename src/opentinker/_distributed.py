@@ -206,6 +206,9 @@ class DistributedEngine:
         request = {**request, "_sampling_session_id": str(uuid.uuid4())}
         return self._first(self._dispatch("create_sampling_session", request))
 
+    def get_sampler(self, sampling_session_id: str) -> dict[str, Any]:
+        return self._local.get_sampler(sampling_session_id)
+
     def sample(self, request: dict[str, Any]) -> dict[str, Any]:
         request = {
             **request,

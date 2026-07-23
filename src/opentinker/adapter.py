@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import shutil
@@ -11,9 +12,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from types import ModuleType, TracebackType
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, Self, cast
 
 import httpx
 import tinker as tinker_module
@@ -40,6 +42,7 @@ class _PodInstance(Protocol):
     url: str
     task_id: str
     management_url: str
+    gateway_stub: Any
     ok: bool
     error_msg: str
 
@@ -96,7 +99,10 @@ class BeamComputeAdapter:
     pool: str | None = None
     pool_fallback: PoolFallback = "wait"
     allow_marketplace: bool = False
-    keep_warm_seconds: int = -1
+    # Give cold model loads and interactive notebook pauses enough time to
+    # begin work. This must stay finite: -1 makes the Pod autoscaler replace a
+    # GPU container after its entrypoint exits successfully.
+    keep_warm_seconds: int = 3600
 
     on_demand: bool = False
     machine_ttl: str = "1h"
@@ -140,6 +146,11 @@ class BeamComputeAdapter:
     )
     _original_service_client: Any | None = field(default=None, init=False, repr=False)
     _service_client_proxy: Any | None = field(default=None, init=False, repr=False)
+    _routed_clients: list[ServiceClient] = field(default_factory=list, init=False, repr=False)
+    _injected_tinker_api_key: bool = field(default=False, init=False, repr=False)
+    _tinker_api_key_was_set: bool = field(default=False, init=False, repr=False)
+    _original_tinker_api_key: str | None = field(default=None, init=False, repr=False)
+    _notebook_exit_callback: Any | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.provider not in ("beam", "beta9"):
@@ -201,8 +212,11 @@ class BeamComputeAdapter:
             raise ValueError("volume_verify_timeout must be between 1 and 7200")
         if not 1 <= self.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
-        if self.keep_warm_seconds != -1 and self.keep_warm_seconds <= 0:
-            raise ValueError("keep_warm_seconds must be -1 or greater than zero")
+        if self.keep_warm_seconds <= 0:
+            raise ValueError(
+                "keep_warm_seconds must be greater than zero; zero can stop a cold "
+                "Pod before startup, while infinite keep-warm can restart it after finish"
+            )
         if self.wait_timeout <= 0 or self.poll_interval <= 0:
             raise ValueError("wait_timeout and poll_interval must be greater than zero")
         if not self.base_image.strip():
@@ -331,6 +345,70 @@ class BeamComputeAdapter:
             if not clean:
                 self._announce_cleanup_failure()
             raise
+
+    @property
+    def _notebook_is_running(self) -> bool:
+        """Whether this adapter still owns a live notebook backend."""
+
+        return self._instance is not None and self._client is not None
+
+    def start_notebook(self, *, wait: bool = True) -> Self:
+        """Start this adapter for a multi-cell Jupyter or marimo workflow.
+
+        Unlike :meth:`start`, this method returns the adapter itself so a later
+        cell can call :meth:`finish` or :meth:`stop`. While it is active,
+        ordinary ``tinker.ServiceClient()`` calls are routed to this backend and
+        tutorial API-key setup cells see a temporary, non-secret compatibility
+        key. Calling this method again on the same adapter is idempotent.
+        """
+
+        if self._notebook_is_running:
+            if wait and not self._notebook_backend_is_healthy():
+                raise RuntimeError(
+                    "the active OpenTinker notebook Pod did not respond to repeated "
+                    "health checks; check its dashboard link, or call "
+                    "opentinker.notebook.stop(), rerun the setup cell, and resume "
+                    "from a saved checkpoint if the task has ended"
+                )
+            self._activate_notebook_client_routing()
+            return self
+        if self._instance is not None or self._client is not None:
+            raise RuntimeError("this adapter has an incomplete backend lifecycle")
+
+        self.start(wait=wait)
+        try:
+            self._activate_notebook_client_routing()
+        except BaseException:
+            clean = self._cleanup(persist_checkpoints=False)
+            if not clean:
+                self._announce_cleanup_failure()
+            raise
+        return self
+
+    def _notebook_backend_is_healthy(self) -> bool:
+        """Check an idempotent setup-cell rerun without touching model state."""
+
+        if self._instance is None:
+            return False
+        headers = (
+            {"Authorization": f"Bearer {self._resolved_token}"} if self._resolved_token else {}
+        )
+        url = f"{_normalize_url(self._instance.url)}/api/v1/healthz"
+        for attempt in range(3):
+            try:
+                response = httpx.get(url, headers=headers, timeout=3)
+                payload = response.json()
+                if (
+                    response.status_code == 200
+                    and isinstance(payload, dict)
+                    and payload.get("status") == "ok"
+                ):
+                    return True
+            except (httpx.HTTPError, TypeError, ValueError):
+                pass
+            if attempt < 2:
+                time.sleep(min(self.poll_interval, 1))
+        return False
 
     def _remember_instance(self, instance: _PodInstance) -> None:
         """Retain monitoring details after cleanup for error reports and callers."""
@@ -502,6 +580,19 @@ class BeamComputeAdapter:
         except Exception:
             logger.exception("Could not restore Tinker's ServiceClient")
             clean = False
+        try:
+            self._restore_tinker_api_key()
+        except Exception:
+            logger.exception("Could not restore TINKER_API_KEY")
+            clean = False
+
+        routed_clients, self._routed_clients = self._routed_clients, []
+        for routed_client in routed_clients:
+            try:
+                self._close_client(routed_client)
+            except Exception:
+                logger.exception("Could not close a routed Tinker client")
+                clean = False
 
         client, self._client = self._client, None
         if client is not None:
@@ -516,9 +607,7 @@ class BeamComputeAdapter:
         if instance is not None:
             if graceful:
                 finish_requested = self._finish_remote(instance)
-                task_status = (
-                    self._wait_for_task_completion(instance) if finish_requested else None
-                )
+                task_status = self._wait_for_task_completion(instance) if finish_requested else None
                 task_completed = task_status == "COMPLETE"
                 clean = finish_requested and task_completed and clean
                 if not finish_requested:
@@ -547,6 +636,7 @@ class BeamComputeAdapter:
             except Exception:
                 logger.exception("Could not release the on-demand Beam/Beta9 machine")
                 clean = False
+        self._unregister_notebook_exit_cleanup()
         return clean
 
     def _prepare_volume_shutdown(self, instance: _PodInstance) -> bool:
@@ -788,11 +878,69 @@ class BeamComputeAdapter:
                 **defaults["default_headers"],
                 **caller_headers,
             }
-            return original(*args, **kwargs)
+            client = original(*args, **kwargs)
+            self._routed_clients.append(client)
+            return client
 
         self._original_service_client = original
         self._service_client_proxy = service_client
         tinker_module.ServiceClient = service_client  # type: ignore[misc]
+
+    def _activate_notebook_client_routing(self) -> None:
+        if self._original_service_client is None:
+            self._install_tinker_api_key()
+            try:
+                self._patch_tinker_service_client()
+                self._register_notebook_exit_cleanup()
+            except BaseException:
+                self._restore_tinker_api_key()
+                raise
+            return
+        if tinker_module.ServiceClient is not self._service_client_proxy:
+            raise RuntimeError(
+                "tinker.ServiceClient was replaced while this notebook session was active"
+            )
+        self._register_notebook_exit_cleanup()
+
+    def _install_tinker_api_key(self) -> None:
+        if self._injected_tinker_api_key or os.environ.get("TINKER_API_KEY"):
+            return
+        self._tinker_api_key_was_set = "TINKER_API_KEY" in os.environ
+        self._original_tinker_api_key = os.environ.get("TINKER_API_KEY")
+        os.environ["TINKER_API_KEY"] = _CLIENT_API_KEY
+        self._injected_tinker_api_key = True
+
+    def _restore_tinker_api_key(self) -> None:
+        if not self._injected_tinker_api_key:
+            return
+        if os.environ.get("TINKER_API_KEY") == _CLIENT_API_KEY:
+            if self._tinker_api_key_was_set:
+                os.environ["TINKER_API_KEY"] = self._original_tinker_api_key or ""
+            else:
+                os.environ.pop("TINKER_API_KEY", None)
+        self._injected_tinker_api_key = False
+        self._tinker_api_key_was_set = False
+        self._original_tinker_api_key = None
+
+    def _register_notebook_exit_cleanup(self) -> None:
+        if self._notebook_exit_callback is not None:
+            return
+        callback = self._stop_notebook_at_exit
+        atexit.register(callback)
+        self._notebook_exit_callback = callback
+
+    def _unregister_notebook_exit_cleanup(self) -> None:
+        callback, self._notebook_exit_callback = self._notebook_exit_callback, None
+        if callback is not None:
+            atexit.unregister(callback)
+
+    def _stop_notebook_at_exit(self) -> None:
+        """Best-effort cancellation when a notebook kernel exits."""
+
+        # Interpreter shutdown may already have torn down logging or HTTP
+        # dependencies. There is no useful caller to surface failures to.
+        with suppress(BaseException):
+            self.stop()
 
     def _restore_tinker_service_client(self) -> None:
         if self._original_service_client is None:

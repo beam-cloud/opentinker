@@ -194,7 +194,22 @@ class TransformersEngine:
     def _target_modules(self, model: Any, config: dict[str, Any]) -> list[str]:
         wanted: set[str] = set()
         if config.get("train_attn", True):
-            wanted.update({"q_proj", "k_proj", "v_proj", "o_proj", "query_key_value"})
+            wanted.update(
+                {
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "query_key_value",
+                    # Qwen3.5 GatedDeltaNet projections. The full-attention
+                    # layers above account for only one quarter of its stack.
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_b",
+                    "in_proj_a",
+                    "out_proj",
+                }
+            )
         if config.get("train_mlp", True):
             wanted.update(
                 {
@@ -288,12 +303,12 @@ class TransformersEngine:
                 )
                 if loss_name == "cross_entropy":
                     per_token_loss = -logprobs
+                    datum_losses = (per_token_loss * batch["weights"]).sum(dim=1)
                 else:
                     per_token_loss = -(
                         torch.exp(logprobs - batch["old_logprobs"]) * batch["advantages"]
                     )
-                denominators = batch["weights"].sum(dim=1).clamp_min(1.0)
-                datum_losses = (per_token_loss * batch["weights"]).sum(dim=1) / denominators
+                    datum_losses = per_token_loss.sum(dim=1)
                 local_loss_sum = datum_losses[: len(local_data)].sum()
                 outputs = [
                     {"logprobs": _tensor_json(logprobs[row, :length])}
@@ -303,12 +318,18 @@ class TransformersEngine:
             if self.distributed_world_size > 1:
                 torch.distributed.all_reduce(metric_loss_sum)
             if backward:
-                scaled_loss = local_loss_sum * self.distributed_world_size / max(1, len(data))
+                # DDP averages gradients across ranks, so compensate here to
+                # preserve the global summed objective implemented by Tinker.
+                scaled_loss = local_loss_sum * self.distributed_world_size
                 scaled_loss.backward()
+            loss_sum = float(metric_loss_sum.cpu())
             response: dict[str, Any] = {
                 "loss_fn_output_type": output_type,
                 "loss_fn_outputs": outputs,
-                "metrics": {"loss:mean": float((metric_loss_sum / max(1, len(data))).cpu())},
+                "metrics": {
+                    "loss:mean": loss_sum / max(1, len(data)),
+                    "loss:sum": loss_sum,
+                },
             }
             if self.distributed_world_size > 1:
                 response["_distributed_indices"] = indices
@@ -650,6 +671,16 @@ class TransformersEngine:
             return dict(self._sampling_sessions[session_id])
         except KeyError as exc:
             raise ValueError(f"unknown sampling_session_id: {session_id}") from exc
+
+    def get_sampler(self, sampling_session_id: str) -> dict[str, Any]:
+        """Return the sampler metadata consumed by the public Tinker client."""
+
+        session = self.sampling_session(sampling_session_id)
+        return {
+            "sampler_id": sampling_session_id,
+            "base_model": str(session["base_model"]),
+            "model_path": session.get("model_path"),
+        }
 
     def register_sampling_session(self, request: dict[str, Any]) -> dict[str, Any]:
         """Install a session created by rank zero after checkpoint serialization."""

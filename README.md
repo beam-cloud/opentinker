@@ -17,15 +17,143 @@ flowchart LR
     GPU --> Volume[("Beam Volume checkpoints")]
 ```
 
-## Install
+## Clone and install
 
-You need Python 3.11+, a configured Beam/Beta9 profile, and Hugging Face access
-to the models you choose.
+You need:
+
+- Git and [uv](https://docs.astral.sh/uv/getting-started/installation/);
+- Python 3.11 or newer;
+- a Beam account with credits; and
+- Hugging Face access to the model you choose.
+
+You do not need a local GPU, CUDA, or Docker. Run this one-time setup in a
+terminal:
 
 ```bash
-uv sync --extra beam --extra examples
-# or: python -m pip install -e '.[beam,examples]'
+mkdir -p ~/opentinker-workspace
+cd ~/opentinker-workspace
+git clone https://github.com/beam-cloud/opentinker.git
+
+cd ~/opentinker-workspace/opentinker
+uv sync --locked --extra beam --extra examples
+uv run beam login
+uv run beam config list
 ```
+
+The last command prints your Beam context names. Use the exact context you
+want as `profile=...` in Python or `--profile ...` in an example command.
+If `opentinker/` already exists, skip `git clone` and update it with
+`git -C ~/opentinker-workspace/opentinker pull`.
+
+For a self-hosted cluster, use `--extra beta9`, `provider="beta9"`, and your
+configured Beta9 profile instead.
+
+## Run an official Tinker notebook
+
+The official tutorials are marimo `.py` notebooks in the separate
+[`tinker-cookbook`](https://github.com/thinking-machines-lab/tinker-cookbook)
+repository. OpenTinker does not bundle those files. The steps below clone the
+exact Cookbook revision tested with this release, copy one tutorial into a
+safe scratch directory, and open it with OpenTinker's locked environment.
+
+### 1. Copy the upstream notebook
+
+Terminal — run from `~/opentinker-workspace`:
+
+```bash
+cd ~/opentinker-workspace
+git clone https://github.com/thinking-machines-lab/tinker-cookbook.git
+git -C tinker-cookbook checkout 3e04119ce293a2b6ba5284e35267c9ba6d27c5da
+mkdir -p notebooks
+cp -n tinker-cookbook/tutorials/303_sft_with_config.py \
+  notebooks/303_sft_with_config_beam.py
+```
+
+`cp -n` will not overwrite an earlier edited copy. If both repositories
+already exist, skip their `git clone` commands.
+
+### 2. Install and open it
+
+Terminal — run from the OpenTinker checkout:
+
+```bash
+cd ~/opentinker-workspace/opentinker
+uv sync --locked --extra beam --extra notebooks
+uv run marimo edit ../notebooks/303_sft_with_config_beam.py
+```
+
+The directories should now be:
+
+```text
+~/opentinker-workspace/
+├── opentinker/          # run uv and Beam commands here
+├── tinker-cookbook/     # unmodified upstream checkout
+└── notebooks/           # your editable notebook copies
+```
+
+### 3. Add one OpenTinker cell
+
+In Marimo, add a code cell at the top, before the tutorial creates
+`tinker.ServiceClient()`. Replace `"default"` with a context printed by
+`uv run beam config list`:
+
+```python
+from opentinker.notebook import start
+
+adapter = start(
+    base_model="Qwen/Qwen3.5-4B",
+    profile="default",
+    gpu="A10G",
+)
+```
+
+Run that cell first and wait for `OpenTinker backend ready: ...`. The first
+run may spend several minutes building the image, downloading the model, and
+starting the GPU. Then run the existing Cookbook cells normally. Leave any
+Tinker API-key field empty: `start()` routes their unchanged
+`tinker.ServiceClient()` calls to Beam.
+
+Do not paste `beam`, `uv run`, or OpenTinker example commands into a notebook
+cell. Login and profile commands run in a terminal; their Python equivalents
+belong in `start(...)`, for example `--gpu-count 4` becomes `gpu_count=4`.
+
+Opening this edited notebook again will run its setup cell and may allocate a
+paid GPU. An exact setup-cell rerun reuses the same Pod instead of creating a
+second one. The default idle window is one hour. If it expires, OpenTinker
+asks you to stop the stale session, rerun the setup cell, and resume from a
+saved checkpoint instead of silently starting over.
+
+### 4. Finish safely
+
+A bare `finish()` cell would auto-run when Marimo reopens the notebook. Add
+these two cells at the bottom so completion requires a click.
+
+Button cell:
+
+```python
+finish_button = mo.ui.run_button(label="Finish OpenTinker task")
+finish_button
+```
+
+Action cell:
+
+```python
+mo.stop(not finish_button.value)
+
+from opentinker.notebook import finish
+
+finish()
+```
+
+Click the button only after training and evaluation finish. Wait until the
+action cell returns `True`; staged Beam Volume writes can take a few minutes
+to flush and verify. This records the task as `COMPLETE` and releases
+adapter-owned hardware. Saved `tinker://...` handles refer to the persistent
+`tinker-checkpoints` Beam Volume, not to files in your local notebook folder.
+
+See [Cookbook notebooks on Beam](docs/cookbook-notebooks.md) for the exact
+directory layout, terminal-versus-notebook commands, on-demand and private-pool
+configuration, safe cancellation, and the tested tutorial matrix.
 
 ## Fine-tune with the Tinker Cookbook
 
@@ -134,7 +262,7 @@ uv run python examples/cookbook_sl_loop.py \
   --gpu-count 4 --interconnect nvlink --batch-size 16 --steps 20
 
 # Run the same workflow on a GPU you attached to Beam
-beam pool join opentinker-gpus --gpu H100 --max-gpus 1 --background
+uv run beam pool join opentinker-gpus --gpu H100 --max-gpus 1 --background
 uv run python examples/cookbook_sl_loop.py \
   --profile default --pool opentinker-gpus --steps 20
 ```

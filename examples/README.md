@@ -1,5 +1,11 @@
 # Examples
 
+Looking for the official interactive Tinker notebooks instead of these
+runnable scripts? Clone `tinker-cookbook` beside this repository and follow
+[Cookbook notebooks on Beam](../docs/cookbook-notebooks.md). That guide shows
+which commands run in the terminal, which code belongs in the first notebook
+cell, and how the flags below map to `BeamComputeAdapter` arguments.
+
 All examples use the same compute flags:
 
 ```text

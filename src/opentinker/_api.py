@@ -40,6 +40,8 @@ class ComputeEngine(Protocol):
 
     def create_sampling_session(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
+    def get_sampler(self, sampling_session_id: str) -> dict[str, Any]: ...
+
     def sample(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
     def runtime_status(self, request: dict[str, Any] | None = None) -> dict[str, Any]: ...
@@ -201,6 +203,10 @@ def create_app(
     @app.post("/api/v1/create_sampling_session")
     def create_sampling_session(request: dict[str, Any]) -> dict[str, Any]:
         return engine.create_sampling_session(request)
+
+    @app.get("/api/v1/samplers/{sampling_session_id}")
+    def get_sampler(sampling_session_id: str) -> dict[str, Any]:
+        return engine.get_sampler(sampling_session_id)
 
     @app.post("/api/v1/create_model")
     def create_model(request: dict[str, Any]) -> dict[str, Any]:
