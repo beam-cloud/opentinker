@@ -70,3 +70,95 @@ def test_operator_command_includes_selected_profile() -> None:
         hardware.operator_command("container", "attach", "pod-123")
         == "beam --context prod3 container attach pod-123"
     )
+
+
+def test_headless_multi_gpu_reservation_selects_a_fitting_offer() -> None:
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        commands.append(command)
+        if "offers" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "offers": [
+                            {
+                                "id": "L40S",
+                                "provider": "shadeform",
+                                "region": "cheap",
+                                "gpu_count": 1,
+                                "available": 2,
+                                "hourly_cost_micros": 968000,
+                            },
+                            {
+                                "id": "L40Sx4",
+                                "provider": "shadeform",
+                                "region": "four-gpu",
+                                "gpu_count": 4,
+                                "available": 1,
+                                "hourly_cost_micros": 3872000,
+                            },
+                            {
+                                "id": "L40Sx8",
+                                "provider": "shadeform",
+                                "region": "eight-gpu",
+                                "gpu_count": 8,
+                                "available": 1,
+                                "hourly_cost_micros": 7744000,
+                            },
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        if "list" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "machines": [
+                            {
+                                "pool_name": "ddp-test",
+                                "gpu": "L40S,L40S,L40S,L40S",
+                                "gpu_count": 4,
+                            }
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    hardware = HardwareManager(
+        provider="beam",
+        profile="prod3",
+        gpu="L40S",
+        gpu_count=4,
+        pool=None,
+        on_demand=True,
+        machine_ttl="2h",
+        machine_name="ddp-test",
+        release_machine=True,
+        run=run,
+        find_executable=lambda _name: "/usr/local/bin/beam",
+        interactive=False,
+        sleep=lambda _seconds: None,
+    )
+
+    selection = hardware.select()
+
+    assert selection.gpu == "L40S"
+    assert selection.pool == "ddp-test"
+    scale = commands[1]
+    assert scale[:6] == [
+        "/usr/local/bin/beam",
+        "--context",
+        "prod3",
+        "pool",
+        "scale",
+        "ddp-test",
+    ]
+    assert scale[scale.index("--offer-id") + 1] == "L40Sx4"
+    assert scale[scale.index("--max-spend") + 1] == "15.49"
+    assert scale[scale.index("--region") + 1] == "four-gpu"

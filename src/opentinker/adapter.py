@@ -355,6 +355,9 @@ class BeamComputeAdapter:
             release_machine=self.release_machine,
             run=subprocess.run,
             find_executable=shutil.which,
+            interactive=sys.stdin.isatty() and sys.stderr.isatty(),
+            reservation_timeout=self.wait_timeout,
+            poll_interval=self.poll_interval,
         )
 
     def _announce_pod(self) -> None:

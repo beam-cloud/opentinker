@@ -148,6 +148,8 @@ for private-pool installers, `machine reserve`, and self-hosted Beta9.
 Beta9 places all N devices in one container on one machine; OpenTinker launches
 one PyTorch process per GPU and DDP synchronizes LoRA gradients with NCCL. NCCL
 uses NVLink or NVSwitch automatically when the machine has it.
+For unattended on-demand runs, OpenTinker selects the cheapest offer with at
+least N GPUs on one node; it never satisfies the request by combining machines.
 `--interconnect nvlink` turns that preference into a startup requirement.
 The base model is replicated, so it must fit on each GPU; use a global batch at
 least as large as the GPU count to keep every rank useful.
