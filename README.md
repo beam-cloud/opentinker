@@ -1,143 +1,194 @@
 # OpenTinker
 
-Run the upstream [`tinker`](https://pypi.org/project/tinker/) SDK on GPUs
-managed by [Beam](https://beam.cloud) or a self-hosted Beta9 cluster.
+Run existing [Tinker](https://github.com/thinking-machines-lab/tinker) training
+code on GPUs managed by [Beam](https://beam.cloud) or a self-hosted Beta9
+cluster.
 
-`BeamComputeAdapter` starts a Tinker-compatible endpoint beside a
-Transformers/PEFT training engine. Your existing Tinker or Cookbook loop keeps
-using `ServiceClient`, datums, futures, renderers, metrics, and checkpoints;
-model forward/backward, AdamW, LoRA training, and sampling happen on the GPU
-you selected. No model work is forwarded to Tinker's managed service.
+Your `tinker` imports, `ServiceClient` calls, training loop, data, losses,
+renderers, futures, and `tinker://...` checkpoint handles stay the same.
+OpenTinker adds the compute backend around that code.
 
-```mermaid
-flowchart LR
-    Code["Tinker or Cookbook workflow"] --> Adapter["BeamComputeAdapter"]
-    Adapter --> Pod["Tinker-compatible Beam Pod"]
-    Pod --> GPU["One or more GPUs on one machine"]
-    GPU --> Volume[("Beam Volume checkpoints")]
-```
+You need Beam credentials (or a configured self-hosted Beta9 cluster), not a
+Tinker account or `TINKER_API_KEY`. Model forward/backward, optimization, and
+sampling run on the GPU you select; default `tinker.ServiceClient()` calls do
+not send model requests to Tinker's hosted service.
 
-## Clone and install
+| Existing Tinker workflow | OpenTinker change |
+| --- | --- |
+| Imports, clients, recipes, data, losses, and configs | No change |
+| Python script | Wrap the Tinker workflow in `BeamComputeAdapter` |
+| Marimo notebook | Remove the hosted-Tinker credential cells; add click-gated `start()` and `finish()` cells |
 
-You need:
+## Existing Tinker project
 
-- Git and [uv](https://docs.astral.sh/uv/getting-started/installation/);
-- Python 3.11 or newer;
-- a Beam account with credits; and
-- Hugging Face access to the model you choose.
+For the Beam path below, you need Python 3.11 or newer, Git,
+[uv](https://docs.astral.sh/uv/getting-started/installation/), and a Beam
+account with credits. You do not need a local GPU, CUDA, or Docker.
 
-You do not need a local GPU, CUDA, or Docker. Run this one-time setup in a
-terminal:
+From your existing project directory, install OpenTinker and log in to Beam:
 
 ```bash
-mkdir -p ~/opentinker-workspace
-cd ~/opentinker-workspace
-git clone https://github.com/beam-cloud/opentinker.git
-
-cd ~/opentinker-workspace/opentinker
-uv sync --locked --extra beam --extra examples
+uv add "opentinker[beam] @ git+https://github.com/beam-cloud/opentinker.git"
 uv run beam login
 uv run beam config list
 ```
 
-The last command prints your Beam context names. Use the exact context you
-want as `profile=...` in Python or `--profile ...` in an example command.
-If `opentinker/` already exists, skip `git clone` and update it with
-`git -C ~/opentinker-workspace/opentinker pull`.
-
-For a self-hosted cluster, use `--extra beta9`, `provider="beta9"`, and your
-configured Beta9 profile instead.
-
-## Run an official Tinker notebook
-
-The official tutorials are marimo `.py` notebooks in the separate
-[`tinker-cookbook`](https://github.com/thinking-machines-lab/tinker-cookbook)
-repository. OpenTinker does not bundle those files. The steps below clone the
-exact Cookbook revision tested with this release, copy one tutorial into a
-safe scratch directory, and open it with OpenTinker's locked environment.
-
-### 1. Copy the upstream notebook
-
-Terminal — run from `~/opentinker-workspace`:
+If the project does not use uv, the equivalent virtual-environment commands
+are:
 
 ```bash
-cd ~/opentinker-workspace
-git clone https://github.com/thinking-machines-lab/tinker-cookbook.git
-git -C tinker-cookbook checkout 3e04119ce293a2b6ba5284e35267c9ba6d27c5da
-mkdir -p notebooks
-cp -n tinker-cookbook/tutorials/303_sft_with_config.py \
-  notebooks/303_sft_with_config_beam.py
+python -m pip install "opentinker[beam] @ git+https://github.com/beam-cloud/opentinker.git"
+beam login
+beam config list
 ```
 
-`cp -n` will not overwrite an earlier edited copy. If both repositories
-already exist, skip their `git clone` commands.
-
-### 2. Install and open it
-
-Terminal — run from the OpenTinker checkout:
-
-```bash
-cd ~/opentinker-workspace/opentinker
-uv sync --locked --extra beam --extra notebooks
-uv run marimo edit ../notebooks/303_sft_with_config_beam.py
-```
-
-The directories should now be:
-
-```text
-~/opentinker-workspace/
-├── opentinker/          # run uv and Beam commands here
-├── tinker-cookbook/     # unmodified upstream checkout
-└── notebooks/           # your editable notebook copies
-```
-
-### 3. Add one OpenTinker cell
-
-In Marimo, add a code cell at the top, before the tutorial creates
-`tinker.ServiceClient()`. Replace `"default"` with a context printed by
-`uv run beam config list`:
+Use a context printed by the last command as `profile=...`. Then wrap the part
+of your program that uses Tinker:
 
 ```python
-from opentinker.notebook import start
+from opentinker import BeamComputeAdapter
 
-adapter = start(
+async def main():
+    with BeamComputeAdapter(
+        base_model=config.model_name,
+        profile="default",
+        gpu="A10G",
+    ):
+        await train.main(config)  # Your existing Tinker workflow.
+```
+
+That is the complete integration. Code inside the context may continue to
+create `tinker.ServiceClient()` itself, as Cookbook recipes do. Start the
+context before the first Tinker client and keep it open through the final
+Tinker request.
+
+If your code accepts a client explicitly, use the ordinary Tinker
+`ServiceClient` returned by the context:
+
+```python
+with BeamComputeAdapter(
     base_model="Qwen/Qwen3.5-4B",
     profile="default",
     gpu="A10G",
-)
+) as service_client:
+    run_existing_tinker_workflow(service_client)
 ```
 
-Run that cell first and wait for `OpenTinker backend ready: ...`. The first
-run may spend several minutes building the image, downloading the model, and
-starting the GPU. Then run the existing Cookbook cells normally. Leave any
-Tinker API-key field empty: `start()` routes their unchanged
-`tinker.ServiceClient()` calls to Beam.
+Use module-style `tinker.ServiceClient()` inside the context. An alias created
+earlier with `from tinker import ServiceClient` cannot be redirected. Leave
+`base_url` unset as ordinary Tinker code does; an explicitly supplied
+`base_url` intentionally bypasses adapter routing.
 
-Do not paste `beam`, `uv run`, or OpenTinker example commands into a notebook
-cell. Login and profile commands run in a terminal; their Python equivalents
-belong in `start(...)`, for example `--gpu-count 4` becomes `gpu_count=4`.
+Use `BeamComputeAdapter` for ordinary Python programs. Use the notebook
+`start()` and `finish()` helpers below only when one workflow spans multiple
+notebook cells. Do not mix the two lifecycle styles.
 
-Opening this edited notebook again will run its setup cell and may allocate a
-paid GPU. An exact setup-cell rerun reuses the same Pod instead of creating a
-second one. The default idle window is one hour. If it expires, OpenTinker
-asks you to stop the stale session, rerun the setup cell, and resume from a
-saved checkpoint instead of silently starting over.
+The public Qwen model below needs no Hugging Face credential. For a private or
+gated model, authenticate the local process (`hf auth login` or a local
+`HF_TOKEN`) because Cookbook code loads tokenizers locally. Also create an
+`HF_TOKEN` secret in Beam/Beta9 and pass `secrets=("HF_TOKEN",)` so the remote
+Pod can load the model.
 
-### 4. Finish safely
+For self-hosted Beta9, install
+`opentinker[beta9]`, then pass `provider="beta9"` and your Beta9 profile.
 
-A bare `finish()` cell would auto-run when Marimo reopens the notebook. Add
-these two cells at the bottom so completion requires a click.
+## Upstream Tinker Cookbook notebook
 
-Button cell:
+This is the complete path for
+[`303_sft_with_config.py`](https://github.com/thinking-machines-lab/tinker-cookbook/blob/3e04119ce293a2b6ba5284e35267c9ba6d27c5da/tutorials/303_sft_with_config.py).
+It preserves the upstream dataset, config, and training code while replacing
+the hosted-Tinker credential and compute lifecycle.
+
+### 1. Clone, copy, and open the tested notebook
+
+Run these commands in a terminal:
+
+```bash
+mkdir -p ~/opentinker-workspace
+cd ~/opentinker-workspace
+
+git clone https://github.com/beam-cloud/opentinker.git
+git clone https://github.com/thinking-machines-lab/tinker-cookbook.git
+git -C tinker-cookbook checkout 3e04119ce293a2b6ba5284e35267c9ba6d27c5da
+
+mkdir -p notebooks
+cp -n tinker-cookbook/tutorials/303_sft_with_config.py \
+  notebooks/303_sft_with_config_beam.py
+
+cd opentinker
+uv sync --locked --extra beam --extra notebooks
+uv run beam login
+uv run beam config list
+uv run marimo edit ../notebooks/303_sft_with_config_beam.py
+```
+
+`cp -n` keeps the upstream checkout clean and will not overwrite an existing
+edited copy. Skip a `git clone` line only when that repository already exists
+at the exact path shown above. Run every later `uv` or `beam` command from
+`~/opentinker-workspace/opentinker`.
+
+### 2. Replace the two Tinker API-key cells
+
+In Marimo, go to **Step 3 — Run training**. Delete both upstream cells:
+
+- the **Paste your Tinker API key** password widget; and
+- the next cell containing `TINKER_API_KEY`, `api_key`, and
+  `await train.main(config)`.
+
+Do not paste a Tinker key and do not leave those cells in the notebook.
+Replace them with these two cells.
+
+Button:
+
+```python
+run_on_beam = mo.ui.run_button(label="Start Beam and run training")
+run_on_beam
+```
+
+Beam setup and the existing training call:
+
+```python
+mo.stop(not run_on_beam.value)
+
+from opentinker.notebook import start
+
+adapter = start(
+    base_model=config.model_name,
+    profile="default",
+    gpu="A10G",
+)
+
+await train.main(config)
+```
+
+Replace `"default"` with the Beam context you selected during installation.
+Click **Start Beam and run training**. OpenTinker prints the Pod ID, dashboard
+URL, attach command, and then `OpenTinker backend ready`. Training starts only
+after that message.
+
+Keep `start(...)` and `await train.main(config)` in the same cell and in that
+order. Marimo schedules cells from variable dependencies, not their visual
+position. The button is also intentional: reopening the notebook will not
+allocate a paid GPU until you click it.
+
+If the notebook still displays **Paste your Tinker API key**, the original
+credential cells have not been removed.
+
+### 3. Finish the Beam task
+
+Add these two cells after the training and evaluation cells.
+
+Button:
 
 ```python
 finish_button = mo.ui.run_button(label="Finish OpenTinker task")
 finish_button
 ```
 
-Action cell:
+Action:
 
 ```python
+adapter
 mo.stop(not finish_button.value)
 
 from opentinker.notebook import finish
@@ -145,224 +196,102 @@ from opentinker.notebook import finish
 finish()
 ```
 
-Click the button only after training and evaluation finish. Wait until the
-action cell returns `True`; staged Beam Volume writes can take a few minutes
-to flush and verify. This records the task as `COMPLETE` and releases
-adapter-owned hardware. Saved `tinker://...` handles refer to the persistent
-`tinker-checkpoints` Beam Volume, not to files in your local notebook folder.
+Click **Finish OpenTinker task** and wait for `True` before closing Marimo.
+That flushes and verifies saved checkpoints, records the Beam task as
+`COMPLETE`, and releases adapter-owned hardware.
 
-See [Cookbook notebooks on Beam](docs/cookbook-notebooks.md) for the exact
-directory layout, terminal-versus-notebook commands, on-demand and private-pool
-configuration, safe cancellation, and the tested tutorial matrix.
+The command boundary is:
 
-## Fine-tune with the Tinker Cookbook
-
-This runs the official Cookbook supervised loop on
-`HuggingFaceH4/no_robots`. With no hardware flags, Beam supplies an A10G.
-
-```bash
-uv run python examples/cookbook_sl_loop.py \
-  --profile default --steps 20 --batch-size 4 --max-length 1024 \
-  --log-path ./runs/no-robots
-```
-
-To fine-tune your own data, put one OpenAI-style conversation on each JSONL
-line:
-
-```json
-{"messages":[{"role":"user","content":"Checkout is down."},{"role":"assistant","content":"{\"priority\":\"P0\",\"team\":\"payments\"}"}]}
-```
-
-```bash
-uv run python examples/finetune_jsonl.py ./train.jsonl \
-  --eval-data ./held-out.jsonl --profile default
-```
-
-The preprocessing helpers validate messages, apply the model's Cookbook
-renderer, and produce ordinary Tinker `Datum`s with assistant-only loss masks.
-See [Data preparation](docs/data-preparation.md) for custom schemas.
-
-## Distill a useful skill into a small model
-
-[`distill_support_router.py`](examples/distill_support_router.py) uses the real
-[`mteb/banking77`](https://huggingface.co/datasets/mteb/banking77) support
-dataset to teach a small model to route banking tickets. A
-[`Qwen3-14B`](https://huggingface.co/Qwen/Qwen3-14B) teacher labels messages
-for 16 easily confused intents; a strict verifier admits only labels whose
-intent, queue, and priority exactly match the dataset policy. The verified
-answers train a [`Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B)
-student.
-
-```bash
-uv run python examples/distill_support_router.py \
-  --profile default --on-demand --gpu L40S
-```
-
-The example makes an honest inference A/B comparison on untouched Banking77
-test rows:
-
-```text
-same held-out tickets
-├── untouched Qwen3-0.6B
-├── Qwen3-14B teacher
-└── distilled Qwen3-0.6B loaded from its saved checkpoint
-```
-
-One verified `prod3` run on an L40S measured:
-
-```text
-untouched Qwen3-0.6B       0/32 exact
-Qwen3-14B teacher         31/32 exact
-distilled Qwen3-0.6B      23/32 exact (71.9%)
-fresh A10G checkpoint     23/32 exact
-verified teacher rows     96/114 attempts
-first/last batch NLL      2.654 -> 0.003
-```
-
-The fresh score came from a second pod after the L40S training pod and
-reservation had terminated.
-
-It fails unless the distilled checkpoint beats the untouched student and
-reaches the configured minimum exact-match accuracy. The output directory
-contains every teacher attempt, the accepted training JSONL, per-case
-predictions, metrics, and checkpoint handles.
-
-Re-run only the A/B test on a fresh GPU:
-
-```bash
-uv run python examples/distill_support_router.py \
-  --profile default --gpu A10G \
-  --checkpoint tinker://<model-id>/sampler_weights/<name>
-```
-
-See [Practical distillation](docs/distillation.md) for the data boundary,
-verification strategy, evaluation design, and ways to adapt the task.
-
-## Choose the GPU
-
-Every example uses the same three modes:
-
-| Command flags | Capacity |
+| Where | What runs there |
 | --- | --- |
-| none | Beam serverless A10G |
-| `--on-demand` | interactive Beam hardware picker |
-| `--on-demand --gpu L40S` | cheapest available matching reservation |
-| `--pool my-gpus` | your existing or self-hosted pool |
+| Terminal | `git clone`, `uv sync`, `beam login`, `beam config list`, `marimo edit` |
+| Notebook | `start(...)`, the existing Tinker workflow, `finish()` |
+| Separate process | `uv run python examples/...` |
 
-For example:
+Running an example command does not configure an already-open notebook; it
+starts a separate workflow. See
+[Cookbook notebooks on Beam](docs/cookbook-notebooks.md) for other tutorials,
+on-demand hardware, private pools, cancellation, and the tested compatibility
+matrix.
 
-```bash
-# Reserve marketplace capacity as part of the run
-uv run python examples/cookbook_sl_loop.py \
-  --profile default --on-demand --gpu H100 --steps 20
+## Choose hardware
 
-# Use every GPU in a 4x machine; fail early unless every pair has NVLink
-uv run python examples/cookbook_sl_loop.py \
-  --profile default --on-demand --gpu H100 \
-  --gpu-count 4 --interconnect nvlink --batch-size 16 --steps 20
+The same options work in `BeamComputeAdapter(...)` and notebook `start(...)`:
 
-# Run the same workflow on a GPU you attached to Beam
-uv run beam pool join opentinker-gpus --gpu H100 --max-gpus 1 --background
-uv run python examples/cookbook_sl_loop.py \
-  --profile default --pool opentinker-gpus --steps 20
-```
+| Arguments | Result |
+| --- | --- |
+| `gpu="A10G"` | Beam serverless A10G |
+| `on_demand=True` | Open Beam's interactive machine picker |
+| `on_demand=True, gpu="H100", gpu_count=4` | Reserve a matching 4-GPU machine |
+| `pool="my-gpus"` | Use hardware you reserved, attached, or self-host |
 
-`--on-demand` without `--gpu` opens Beam's native picker. `--pool` discovers
-the connected GPU automatically, and OpenTinker never releases capacity it
-did not create. See [Bring your own hardware](docs/bring-your-own-hardware.md)
-for private-pool installers, `machine reserve`, and self-hosted Beta9.
+Add `interconnect="nvlink"` when every requested GPU must have NVLink or
+NVSwitch connectivity. OpenTinker uses single-node PyTorch DDP for
+`gpu_count > 1`. See
+[Bring your own hardware](docs/bring-your-own-hardware.md) for private pools
+and self-hosted Beta9.
 
-`--gpu-count N` is one distributed training job, not N independent Pods.
-Beta9 places all N devices in one container on one machine; OpenTinker launches
-one PyTorch process per GPU and DDP synchronizes LoRA gradients with NCCL. NCCL
-uses NVLink or NVSwitch automatically when the machine has it.
-For unattended on-demand runs, OpenTinker selects the cheapest offer with at
-least N GPUs on one node; it never satisfies the request by combining machines.
-`--interconnect nvlink` turns that preference into a startup requirement.
-The base model is replicated, so it must fit on each GPU; use a global batch at
-least as large as the GPU count to keep every rank useful.
-[`multigpu_finetune.py`](examples/multigpu_finetune.py) is the end-to-end
-reference: real No Robots data, held-out NLL, Volume checkpoints, and a
-checkpoint reload assertion.
+With `on_demand=True`, Beam's picker appears in the terminal that launched
+Marimo. Supplying `gpu="H100"` filters that picker; it does not move the picker
+into the notebook.
 
-## Monitor, interrupt, and resume
+## Checkpoints and task lifetime
 
-As soon as the Pod exists, every run prints its container ID, live dashboard
-URL, and exact attach command:
-
-```text
-OpenTinker Pod created: pod-...
-  dashboard: https://platform.beam.cloud/containers
-  attach:    beam --context default container attach pod-...
-```
-
-A successful workflow flushes and verifies its checkpoints, exits the Pod
-entrypoint with status zero, waits for the Beam/Beta9 task to become
-`COMPLETE`, and then releases adapter-owned reservations. Ctrl+C and explicit
-`adapter.stop()` are cancellation paths: they preserve completed checkpoints
-before terminating the Pod. Tinker's checkpoint methods return normal handles
-backed by a persistent Beam Volume:
+- Normal completion flushes checkpoints, waits for task status `COMPLETE`, and
+  releases only hardware OpenTinker reserved.
+- In a Python `BeamComputeAdapter` context, Ctrl+C and exceptions trigger
+  cleanup. In a notebook, use the click-gated `finish()` above or the
+  click-gated `stop()` pattern in the notebook guide; interrupting an
+  unrelated Marimo cell is not a graceful finish.
+- State and sampler handles remain ordinary Tinker paths:
 
 ```text
 tinker://<model-id>/weights/<name>
 tinker://<model-id>/sampler_weights/<name>
 ```
 
-Checkpoint publication is verified in the Pod. OpenTinker hashes the bytes
-written to the mounted Volume, places that SHA-256 on the same geesefs object
-upload, calls `fsync()`, and requires the remote ETag before reporting success.
-It does not download the checkpoint again to verify it.
+They are stored on the provider's persistent `tinker-checkpoints` Volume and
+can be loaded by a fresh Pod configured with the same `base_model` and
+`volume_name`. OpenTinker verifies staged Volume writes inside the Pod without
+downloading every published object.
 
-Use those handles unchanged with `load_state()`,
-`create_training_client_from_state_with_optimizer()`, or
-`create_sampling_client(model_path=...)`.
+## Working examples
 
-## Drop-in Python use
+From the cloned OpenTinker repository, fine-tune on the real No Robots
+dataset:
 
-The adapter can wrap a recipe whose internals create their own
-`tinker.ServiceClient()`:
-
-```python
-from tinker_cookbook.recipes.sl_loop import Config
-from tinker_cookbook.recipes.sl_loop import main as supervised_fine_tune
-
-from opentinker import BeamComputeAdapter
-
-with BeamComputeAdapter(
-    base_model="Qwen/Qwen3-0.6B",
-    profile="default",
-    gpu="A10G",
-):
-    supervised_fine_tune(
-        Config(
-            model_name="Qwen/Qwen3-0.6B",
-            max_steps=20,
-            log_path="./runs/no-robots",
-        )
-    )
+```bash
+uv run python examples/cookbook_sl_loop.py \
+  --profile default --steps 20 --batch-size 4 --max-length 1024
 ```
 
-Or use `import opentinker as tinker`; OpenTinker delegates the upstream
-package's public API while adding `BeamComputeAdapter`.
+Distill a 16-intent Banking77 support router from Qwen3-14B into Qwen3-0.6B:
+
+```bash
+uv run python examples/distill_support_router.py \
+  --profile default --on-demand --gpu L40S
+```
+
+The verified run improved the held-out student from `0/32` to `23/32` exact
+and reproduced `23/32` after loading its saved checkpoint in a fresh A10G
+Pod. See [Examples](examples/) and
+[Practical distillation](docs/distillation.md).
 
 ## Compatibility
 
-The single-node backend supports upstream Tinker training and sampling
-clients, token-input cross-entropy and importance-sampling losses, PEFT LoRA,
-AdamW, state/optimizer resume, sampler checkpoints, sequence-level
-distillation, the Cookbook supervised loop, and data-parallel training across
-multiple GPUs. Sampling requests with several completions are also distributed
-across the allocated GPUs.
+OpenTinker currently supports causal-language-model sampling, PEFT LoRA,
+AdamW, cross-entropy and importance-sampling losses, state/optimizer resume,
+sampler checkpoints, sequence-level distillation, the Cookbook supervised
+loop, and single-node multi-GPU DDP.
 
-Multi-node training, parameter sharding/tensor parallelism, multimodal inputs,
-arbitrary custom loss functions, logit-level distillation, and the full Tinker
-account-management API are not implemented. Adapter contexts are
-process-global and must not overlap.
+Multi-node training, parameter sharding, multimodal inputs, arbitrary custom
+loss functions, logit-level distillation, and the full Tinker
+account-management API are not implemented. Adapter routing is process-global,
+so adapter contexts must not overlap.
 
 More detail:
 
-- [Examples](examples/)
 - [Fine-tuning and distillation: the ML view](docs/ml-training.md)
 - [System diagrams](docs/system-diagrams.md)
 - [Data preparation](docs/data-preparation.md)
-- [Bring your own hardware](docs/bring-your-own-hardware.md)
+- [Cookbook notebook compatibility](docs/cookbook-notebooks.md#tutorial-compatibility)

@@ -24,8 +24,15 @@ agree.
 ## 1. Check the prerequisites
 
 You need Git, [uv](https://docs.astral.sh/uv/getting-started/installation/),
-Python 3.11 or newer, a Beam account with credits, and Hugging Face access to
-the model you choose. No local GPU, CUDA toolkit, or Docker daemon is needed.
+Python 3.11 or newer, and Hugging Face access to the model you choose. Beam
+runs require a Beam account with credits; self-hosted runs require a
+configured Beta9 profile and GPU cluster. No local GPU, CUDA toolkit, or Docker
+daemon is needed.
+
+Public models need no Hugging Face login. For a private or gated model,
+authenticate both sides: use `hf auth login` (or a local `HF_TOKEN`) for
+Cookbook tokenizer loading, then create an `HF_TOKEN` provider secret and pass
+`secrets=("HF_TOKEN",)` to `start(...)` for the remote Pod.
 
 Confirm Git and uv in a terminal:
 
@@ -57,8 +64,8 @@ uv run beam config list
 skip it and confirm the profile you want appears in `beam config list`.
 Copy that context name exactly into the notebook's `profile=...` argument.
 
-These are one-time clone commands. If a checkout already exists, do not clone
-over it. Update OpenTinker with
+These are one-time clone commands. Skip one only when that checkout already
+exists at the exact path shown above. Update OpenTinker with
 `git -C ~/opentinker-workspace/opentinker pull`. Keep the Cookbook checkout at
 the tested commit above; a later OpenTinker release may name a newer tested
 revision.
@@ -71,17 +78,22 @@ uv sync --locked --extra beta9 --extra notebooks
 uv run beta9 config list
 ```
 
-Its setup cell must also select the Beta9 provider:
+When you replace the credential cells in step 4, use the Beta9 provider in
+that same click-gated setup-and-training cell:
 
 ```python
+mo.stop(not run_on_beam.value)
+
 from opentinker.notebook import start
 
 adapter = start(
-    base_model="Qwen/Qwen3.5-4B",
+    base_model=config.model_name,
     provider="beta9",
     profile="my-beta9-profile",
     pool="my-gpu-pool",
 )
+
+await train.main(config)
 ```
 
 The `notebooks` extra installs the current Tinker Cookbook package and tutorial
@@ -108,52 +120,66 @@ Cookbook checkout remains clean and pinned to the tested revision. `cp -n`
 refuses to overwrite an existing edited copy. Choose another destination
 filename when you want a second experiment.
 
-## 4. Add one Beam setup cell
+## 4. Replace the hosted-Tinker credential cells
 
-In the Marimo editor, add a code cell at the very top, before the tutorial's
-Tinker API-key and `ServiceClient` cells. Replace `"default"` with the exact
-context shown by `uv run beam config list`:
+You do not need a Tinker account or Tinker API key. In Tutorial 303, go to
+**Step 3 — Run training** and delete both upstream cells:
+
+1. the **Paste your Tinker API key** password widget; and
+2. the next cell containing `TINKER_API_KEY`, `api_key`, and
+   `await train.main(config)`.
+
+Do not add an unrelated setup cell at the top and leave the credential cells
+in place. Marimo schedules cells from variable dependencies, not their visual
+position, so that arrangement can run the API-key check before Beam is ready.
+
+Replace the two deleted cells with these two cells.
+
+Button:
 
 ```python
+run_on_beam = mo.ui.run_button(label="Start Beam and run training")
+run_on_beam
+```
+
+Beam setup and training:
+
+```python
+mo.stop(not run_on_beam.value)
+
 from opentinker.notebook import start
 
 adapter = start(
-    base_model="Qwen/Qwen3.5-4B",
+    base_model=config.model_name,
     profile="default",
     gpu="A10G",
 )
+
+await train.main(config)
 ```
 
-Use the exact model configured later in the notebook. Tutorial 303 currently
-uses `Qwen/Qwen3.5-4B`. One OpenTinker backend serves one base model.
+Replace `"default"` with the exact context shown by
+`uv run beam config list`. Keep `start(...)` and the existing training call in
+the same cell and in that order. Tutorial 303's `config.model_name` is
+`Qwen/Qwen3.5-4B`; one OpenTinker backend trains one base model. Sampling
+clients may use another base model for inference, which is how
+teacher-to-student distillation works.
 
-`start()` does three notebook-specific things:
+Click **Start Beam and run training**. OpenTinker prints the Pod ID, dashboard
+URL, attach command, and then `OpenTinker backend ready: ...`. A cold first run
+can spend several minutes building the image, downloading the model, and
+starting the GPU. Training begins only after the backend is ready.
 
-1. starts the Beam Pod and prints its dashboard and attach command;
-2. routes later, unchanged `tinker.ServiceClient()` calls to that Pod; and
-3. satisfies the upstream tutorial's API-key gate without requiring a Tinker
-   account key.
-
-Run only this new cell first. Wait until it prints
-`OpenTinker backend ready: ...`; a cold first run can spend several minutes
-building the image, downloading the model, and starting the GPU. Leave any
-Tinker API-key field empty, then run the existing Tutorial 303 cells normally.
+The click gate prevents Marimo from allocating a paid GPU or restarting
+training merely because the notebook was opened. An exact `start()` rerun
+reuses the active Pod. The default idle grace is one hour; if the task has
+ended, call `stop()`, start again, and explicitly resume from a saved
+checkpoint instead of silently losing training state.
 
 Do not paste an OpenTinker example CLI command into a shell cell and expect
 later notebook cells to use it: that command runs a separate Python process
-and a separate training workflow. Run `beam login`, `beam config list`, and
-monitoring commands in a terminal. Put hardware selection in `start(...)`.
-
-The setup cell is safe to rerun. It returns the active adapter instead of
-starting a second Pod with the same configuration.
-
-Marimo executes saved cells when a notebook opens. Reopening this edited
-notebook therefore starts the setup cell and can allocate paid GPU capacity.
-The default idle grace is one hour. If it expires, an exact setup-cell rerun
-reports that the old backend is unreachable; call `stop()`, rerun the setup
-cell, and explicitly resume from a saved checkpoint. OpenTinker will not
-silently replace lost training state. Explicit completion is still the safest
-and cheapest path.
+and a separate workflow. Run `beam login`, `beam config list`, and monitoring
+commands in a terminal. Put hardware selection in `start(...)`.
 
 ## 5. Complete the remote task
 
@@ -172,6 +198,7 @@ finish_button
 Action cell:
 
 ```python
+adapter
 mo.stop(not finish_button.value)
 
 from opentinker.notebook import finish
@@ -180,7 +207,7 @@ finish()
 ```
 
 Click the button and keep Marimo open until the action cell returns `True`.
-`finish()` flushes and verifies completed checkpoints on the Beam Volume,
+`finish()` flushes and verifies completed checkpoints on the provider Volume,
 asks the remote process to exit with status zero, waits for the Beam task to
 become `COMPLETE`, and releases only hardware that OpenTinker reserved. Staged
 Volume writes can take several minutes to upload and verify.
@@ -204,18 +231,25 @@ from opentinker.notebook import stop
 stop()
 ```
 
-`stop()` preserves completed Volume checkpoints and terminates the Pod. The
-setup cell prints the live dashboard URL and attach command, so you can still
-inspect a long-running cell from another terminal.
+`stop()` preserves completed Volume checkpoints and terminates the Pod. It
+becomes effective after `OpenTinker backend ready` is printed. If you need to
+abort during cold startup, interrupt the setup-and-training cell; `start()`
+cleans up a partially created Pod. The setup cell prints the live dashboard
+URL and attach command, so you can still inspect a long-running cell from
+another terminal.
 
 If the notebook kernel exits without either call, OpenTinker performs a
-best-effort `stop()` so the Pod is not orphaned. That is a cancellation path;
-use `finish()` when you want the Beam task recorded as `COMPLETE`.
+best-effort `stop()` so the Pod is not orphaned. Interrupting a later Marimo
+cell does not itself finish or stop the notebook backend. Use the cancel
+button explicitly, or use `finish()` when you want the Beam task recorded as
+`COMPLETE`.
 
 Checkpoint handles such as
-`tinker://<model-id>/sampler_weights/<name>` point into the persistent
-`tinker-checkpoints` Beam Volume. They are not local files under
-`~/opentinker-workspace/notebooks`.
+`tinker://<model-id>/sampler_weights/<name>` point into the provider's
+persistent `tinker-checkpoints` Volume. They are not local files under
+`~/opentinker-workspace/notebooks`. A fresh Pod loading one must use the same
+`base_model` and `volume_name`; those values are not encoded in a
+`tinker://...` handle.
 
 ## Translate example CLI flags into a notebook cell
 
@@ -246,24 +280,29 @@ uv run python examples/cookbook_sl_loop.py \
   --gpu-count 4 --interconnect nvlink
 ```
 
-becomes this notebook setup cell:
+becomes these arguments in the same click-gated setup-and-training cell:
 
 ```python
+mo.stop(not run_on_beam.value)
+
 from opentinker.notebook import start
 
 adapter = start(
-    base_model="Qwen/Qwen3.5-4B",
+    base_model=config.model_name,
     profile="default",
     on_demand=True,
     gpu="L40S",
     gpu_count=4,
     interconnect="nvlink",
 )
+
+await train.main(config)
 ```
 
-`on_demand=True` without `gpu` opens Beam's interactive machine picker.
-`pool="my-gpus"` uses hardware you already reserved or attached and never
-releases that user-owned pool.
+On an interactive run, `on_demand=True` opens Beam's machine picker in the
+terminal that launched Marimo. Adding `gpu="L40S"` filters the picker to that
+GPU type. `pool="my-gpus"` uses hardware you already reserved or attached and
+never releases that user-owned pool.
 
 Flags such as `--steps`, `--batch-size`, `--learning-rate`, `--renderer`, and
 data or output paths configure the training workflow. Change the corresponding
@@ -281,29 +320,33 @@ sampling, PEFT LoRA training, AdamW, cross-entropy and importance-sampling
 losses, checkpoint resume, and sequence-level distillation. It does not
 pretend to support every current Cookbook tutorial.
 
-“Verified” means a notebook from commit `3e04119c` was run on a production
-Beam A10G with only the OpenTinker lifecycle cells added. A “verified variant”
-also changes the model, checkpoint, or prompt named in the row. “Audited”
-means its API path was checked against the backend and local tests, but the
-complete notebook was not part of this production acceptance run.
+“Verified” means the notebook's upstream model, data, config, and training
+path from commit `3e04119c` ran on a production Beam A10G. That acceptance run
+manually started Beam before training; the deterministic click-gated cell
+layout above was subsequently checked with Marimo's strict validator and
+Python compilation. A “verified variant” also changes the model, checkpoint,
+or prompt named in the row. “Audited” means its API path was checked against
+the backend and local tests, but the complete notebook was not part of this
+production acceptance run.
 
 | Tutorial | Verification | Status on OpenTinker |
 | --- | --- | --- |
 | `101_hello_tinker.py` | Verified checkpoint-reload variant | The notebook's base-model sampling cell was pointed at Tutorial 303's 1.56 GB sampler checkpoint and a translation prompt. A fresh A10G Pod loaded it through `model_path`, resolved `get_tokenizer()`, generated “Bonjour,” finished as `COMPLETE`, and left no replacement container. |
-| `102_first_sft.py` | Audited | The Qwen3.5 SFT and post-training sampling sections work. Stop before the later Kimi K2.6 section: one OpenTinker backend cannot serve a second base model. |
+| `102_first_sft.py` | Audited | The Qwen3.5 SFT and post-training sampling sections work. Before the later Kimi K2.6 training section, finish the first backend and start another with Kimi as its trainable `base_model`. |
 | `103_async_patterns.py` | Audited | Sampling works, but concurrent requests are queued by one engine; use multi-completion sampling to spread work across GPUs. |
 | `201_rendering.py` | Audited | Local rendering sections work; multimodal model compute is not supported. |
 | `202_loss_functions.py` | Audited | Cross-entropy and importance-sampling sections only; PPO, CISPO, and arbitrary custom loss backward passes are unsupported. |
 | `203_completers.py` | Audited | Token and message completers work when the adapter model matches. |
-| `204_weights.py` | Audited | State and sampler save/load work on the Beam Volume. TTL, listing, publication, archive, and download sections are not supported. |
+| `204_weights.py` | Audited | State and sampler save/load work on the provider Volume. TTL, listing, publication, archive, and download sections are not supported. |
 | `205_evaluations.py` | Audited | Cross-entropy evaluation and checkpoint sampling work. |
 | `303_sft_with_config.py` | Verified end to end | Recommended first training notebook. The upstream dataset/config loop trained Qwen3.5-4B, saved state and sampler checkpoints, verified their remote Volume objects, and completed cleanly. |
 | `406_prompt_distillation.py` | Audited | Its single-model sequence-level prompt-distillation workflow is supported. |
 | `501`–`503` deployment tutorials | Unsupported | Hugging Face merge, archive export, and Hub publication are not implemented by the OpenTinker backend. |
 
-RL, multimodal, multi-model, and custom-loss tutorials should currently be
-treated as upstream reference material, not drop-in OpenTinker workflows. See
-[Compatibility](../README.md#compatibility) for the backend boundary.
+RL, multimodal, multiple-trainable-model, and custom-loss tutorials should
+currently be treated as upstream reference material, not drop-in OpenTinker
+workflows. See [Compatibility](../README.md#compatibility) for the backend
+boundary.
 
 ## Open another notebook
 
@@ -317,6 +360,44 @@ cd ~/opentinker-workspace/opentinker
 uv run marimo edit ../notebooks/101_hello_tinker_beam.py
 ```
 
-Change only the tutorial path and the `base_model` in the setup cell. Run
-`finish()` before moving to another notebook so the first Pod and any
-adapter-owned reservation complete cleanly.
+Every upstream notebook must have its hosted-Tinker password widget and API-key
+guard removed. For Tutorial 101, replace the password widget with:
+
+```python
+run_on_beam = mo.ui.run_button(label="Start Beam and run tutorial")
+run_on_beam
+```
+
+Replace the entire following cell—the one that imports `os`, checks
+`TINKER_API_KEY`, and creates `service_client`—with these two cells.
+
+Setup:
+
+```python
+mo.stop(not run_on_beam.value)
+
+from opentinker.notebook import start
+
+adapter = start(
+    base_model="Qwen/Qwen3.5-9B-Base",
+    profile="default",
+    gpu="A10G",
+)
+```
+
+Service client and the original capabilities check:
+
+```python
+adapter
+service_client = tinker.ServiceClient()
+
+capabilities = await service_client.get_server_capabilities_async()
+print("Available models:")
+for model in capabilities.supported_models:
+    print(f"  - {model.model_name}")
+```
+
+Keep the model passed to `start()` identical to the model requested later in
+the notebook. The `adapter` line is required: it makes the Tinker cell depend
+on setup in Marimo. Run `finish()` before moving to another notebook so the
+first Pod and any adapter-owned reservation complete cleanly.

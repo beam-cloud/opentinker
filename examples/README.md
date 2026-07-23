@@ -3,8 +3,8 @@
 Looking for the official interactive Tinker notebooks instead of these
 runnable scripts? Clone `tinker-cookbook` beside this repository and follow
 [Cookbook notebooks on Beam](../docs/cookbook-notebooks.md). That guide shows
-which commands run in the terminal, which code belongs in the first notebook
-cell, and how the flags below map to `BeamComputeAdapter` arguments.
+which commands run in the terminal, which upstream Tinker credential cells to
+replace, and how the flags below map to `BeamComputeAdapter` arguments.
 
 All examples use the same compute flags:
 
@@ -37,7 +37,8 @@ uv run python examples/multigpu_finetune.py \
 
 Use `--on-demand` instead of `--pool` to select the 4x machine in Beam's
 picker. Add `--interconnect nvlink` only for a linked machine; the default
-records either `nvlink` or `pcie` in the result without rejecting it.
+records the detected topology (`single`, `nvlink`, `pcie`, `mixed`, or
+`unknown`) without rejecting it.
 
 ## Real-world teacher-to-student distillation
 
@@ -65,7 +66,7 @@ Artifacts:
 - `teacher_audit.jsonl`: accepted and rejected teacher attempts
 - `verified_teacher_data.jsonl`: the actual student training set
 - `results.json`: per-case base, teacher, and distilled predictions
-- `tinker://...` state and sampler handles stored on the Beam Volume
+- `tinker://...` state and sampler handles stored on the provider Volume
 
 Use `--checkpoint tinker://...` in a second run to prove the saved student
 works in a fresh Pod. Read
@@ -94,11 +95,16 @@ Evaluate a saved state checkpoint against held-out No Robots examples:
 ```bash
 uv run python examples/evaluate_checkpoint.py \
   tinker://<model-id>/weights/<name> \
+  --model Qwen/Qwen3-4B-Instruct-2507 \
+  --volume-name tinker-checkpoints \
   --profile default --gpu A10G --examples 8
 ```
 
 Pass a `tinker://.../sampler_weights/...` handle to the same command to load
-the persisted adapter in a fresh Pod and run generation instead.
+the persisted adapter in a fresh Pod and run generation instead. Always repeat
+the checkpoint's originating `--model` and `--volume-name`; the handle itself
+does not encode them. For a default `finetune_jsonl.py` checkpoint, use
+`--model Qwen/Qwen3-0.6B`.
 
 See [`docs/data-preparation.md`](../docs/data-preparation.md) for schemas,
 rendering, loss masks, and preprocessing helpers.
