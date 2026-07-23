@@ -168,9 +168,12 @@ OpenTinker Pod created: pod-...
   attach:    beam --context default container attach pod-...
 ```
 
-Ctrl+C terminates the Pod after flushing completed checkpoints and releases
-only adapter-owned reservations. Tinker's checkpoint methods return normal
-handles backed by a persistent Beam Volume:
+A successful workflow flushes and verifies its checkpoints, exits the Pod
+entrypoint with status zero, waits for the Beam/Beta9 task to become
+`COMPLETE`, and then releases adapter-owned reservations. Ctrl+C and explicit
+`adapter.stop()` are cancellation paths: they preserve completed checkpoints
+before terminating the Pod. Tinker's checkpoint methods return normal handles
+backed by a persistent Beam Volume:
 
 ```text
 tinker://<model-id>/weights/<name>

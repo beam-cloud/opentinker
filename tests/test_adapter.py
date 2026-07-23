@@ -57,6 +57,7 @@ class FakePodInstance:
         error_msg: str = "",
     ) -> None:
         self.container_id = "pod-123"
+        self.task_id = "task-123"
         self.url = url
         self.management_url = management_url
         self.ok = ok
@@ -121,6 +122,10 @@ def patch_adapter_dependencies(
     monkeypatch.setattr(beam_module, "ServiceClient", service_client)
     monkeypatch.setattr(BeamComputeAdapter, "_load_provider", lambda _self: provider)
     monkeypatch.setattr(BeamComputeAdapter, "_prepare_volume_shutdown", lambda *_args: True)
+    monkeypatch.setattr(BeamComputeAdapter, "_finish_remote", lambda *_args: True)
+    monkeypatch.setattr(
+        BeamComputeAdapter, "_wait_for_task_completion", lambda *_args: "COMPLETE"
+    )
     return clients
 
 
@@ -344,7 +349,7 @@ def test_context_scopes_cookbook_created_service_clients(
     assert holder_calls[0]["api_key"] == "tml-beam-compute"
     assert holder_calls[0]["default_headers"]["Authorization"] == "Bearer provider-token"
     assert holder_calls[0]["user_metadata"] == {"recipe": "grpo"}
-    assert instance.terminate_calls == 1
+    assert instance.terminate_calls == 0
 
 
 def test_builds_owned_backend_image(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -509,6 +514,74 @@ def test_cleanup_attempts_every_resource_after_close_failure(
     assert adapter._client is None
     assert adapter._instance is None
     assert instance.terminate_calls == 1
+    assert released is True
+
+
+def test_graceful_finish_does_not_cancel_when_status_observation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B")
+    instance = FakePodInstance()
+    adapter._instance = instance
+    released = False
+
+    def release() -> bool:
+        nonlocal released
+        released = True
+        return True
+
+    monkeypatch.setattr(adapter, "_finish_remote", lambda _instance: True)
+    monkeypatch.setattr(adapter, "_wait_for_task_completion", lambda _instance: None)
+    monkeypatch.setattr(adapter, "_release_reserved_machine", release)
+
+    assert adapter.finish() is False
+    assert instance.terminate_calls == 0
+    assert released is False
+
+
+def test_wait_for_task_completion_uses_profiled_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B", poll_interval=0.01)
+    instance = FakePodInstance()
+    requests: list[Any] = []
+    statuses = ["RUNNING", "COMPLETE"]
+
+    class Gateway:
+        def list_tasks(self, request: Any) -> SimpleNamespace:
+            requests.append(request)
+            return SimpleNamespace(
+                ok=True,
+                err_msg="",
+                tasks=[SimpleNamespace(status=statuses.pop(0))],
+            )
+
+    instance.gateway_stub = Gateway()
+    monkeypatch.setattr(beam_module.time, "sleep", lambda _delay: None)
+
+    assert adapter._wait_for_task_completion(cast(Any, instance)) == "COMPLETE"
+    assert requests[0].filters["id"].values == ["task-123"]
+
+
+def test_graceful_finish_releases_hardware_after_terminal_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B")
+    instance = FakePodInstance()
+    adapter._instance = instance
+    released = False
+
+    def release() -> bool:
+        nonlocal released
+        released = True
+        return True
+
+    monkeypatch.setattr(adapter, "_finish_remote", lambda _instance: True)
+    monkeypatch.setattr(adapter, "_wait_for_task_completion", lambda _instance: "ERROR")
+    monkeypatch.setattr(adapter, "_release_reserved_machine", release)
+
+    assert adapter.finish() is False
+    assert instance.terminate_calls == 0
     assert released is True
 
 

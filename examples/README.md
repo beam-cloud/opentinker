@@ -12,8 +12,9 @@ no flags              -> Beam serverless A10G
 ```
 
 Every run prints its Beam dashboard URL and attach command as soon as the Pod
-exists. Ctrl+C stops the Pod, preserves completed Volume checkpoints, and
-releases only capacity the adapter reserved.
+exists. Successful runs exit naturally and are recorded as `COMPLETE`. Ctrl+C
+stops the Pod, preserves completed Volume checkpoints, and releases only
+capacity the adapter reserved.
 
 ## Multi-GPU acceptance run
 

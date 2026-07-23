@@ -93,7 +93,15 @@ async def retrieve(client: httpx.AsyncClient, future: dict[str, Any]) -> dict[st
 
 
 async def test_owned_server_implements_tinker_contract() -> None:
-    transport = httpx.ASGITransport(app=create_app(ContractEngine()))
+    shutdown_requests = 0
+
+    def request_shutdown() -> None:
+        nonlocal shutdown_requests
+        shutdown_requests += 1
+
+    transport = httpx.ASGITransport(
+        app=create_app(ContractEngine(), request_shutdown=request_shutdown)
+    )
     client = httpx.AsyncClient(transport=transport, base_url="http://test")
 
     health = (await client.get("/api/v1/healthz")).json()
@@ -121,6 +129,10 @@ async def test_owned_server_implements_tinker_contract() -> None:
         "volume_paths": [],
         "checkpoints": [],
     }
+    assert shutdown_requests == 0
+    finish = (await client.post("/opentinker/finish")).json()
+    assert finish == shutdown
+    assert shutdown_requests == 1
 
     create_future = (
         await client.post(

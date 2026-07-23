@@ -77,7 +77,15 @@ def main() -> None:
         if world_size > 1
         else engine
     )
-    uvicorn.run(create_app(compute_engine), host="0.0.0.0", port=port)
+    server_ref: list[uvicorn.Server] = []
+
+    def request_shutdown() -> None:
+        server_ref[0].should_exit = True
+
+    app = create_app(compute_engine, request_shutdown=request_shutdown)
+    server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port))
+    server_ref.append(server)
+    server.run()
 
 
 __all__ = ["ComputeEngine", "FutureStore", "TransformersEngine", "create_app", "main"]

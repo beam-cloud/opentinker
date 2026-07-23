@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 class _PodInstance(Protocol):
     container_id: str
     url: str
+    task_id: str
     management_url: str
     ok: bool
     error_msg: str
@@ -485,9 +486,14 @@ class BeamComputeAdapter:
     def stop(self) -> bool:
         """Close the Tinker client and terminate the adapter-created Pod."""
 
-        return self._cleanup(persist_checkpoints=True)
+        return self._cleanup(persist_checkpoints=True, graceful=False)
 
-    def _cleanup(self, *, persist_checkpoints: bool) -> bool:
+    def finish(self) -> bool:
+        """Flush checkpoints and let the Pod's task complete naturally."""
+
+        return self._cleanup(persist_checkpoints=True, graceful=True)
+
+    def _cleanup(self, *, persist_checkpoints: bool, graceful: bool = False) -> bool:
         """Release every owned resource, including after a partial startup."""
 
         clean = True
@@ -506,30 +512,58 @@ class BeamComputeAdapter:
                 clean = False
 
         instance, self._instance = self._instance, None
+        release_hardware = True
         if instance is not None:
-            if persist_checkpoints:
-                clean = self._prepare_volume_shutdown(instance) and clean
-            try:
-                clean = instance.terminate() and clean
-            except Exception:
-                logger.exception("Could not terminate the Beam/Beta9 Pod")
-                clean = False
+            if graceful:
+                finish_requested = self._finish_remote(instance)
+                task_status = (
+                    self._wait_for_task_completion(instance) if finish_requested else None
+                )
+                task_completed = task_status == "COMPLETE"
+                clean = finish_requested and task_completed and clean
+                if not finish_requested:
+                    try:
+                        instance.terminate()
+                    except Exception:
+                        logger.exception("Could not terminate the Beam/Beta9 Pod")
+                elif task_status is None:
+                    # Do not turn a successful remote exit into CANCELLED just
+                    # because local status observation failed. Also retain
+                    # owned hardware so releasing the node cannot race exit 0.
+                    release_hardware = False
+            else:
+                if persist_checkpoints:
+                    clean = self._prepare_volume_shutdown(instance) and clean
+                try:
+                    clean = instance.terminate() and clean
+                except Exception:
+                    logger.exception("Could not terminate the Beam/Beta9 Pod")
+                    clean = False
 
         self._resolved_token = None
-        try:
-            clean = self._release_reserved_machine() and clean
-        except Exception:
-            logger.exception("Could not release the on-demand Beam/Beta9 machine")
-            clean = False
+        if release_hardware:
+            try:
+                clean = self._release_reserved_machine() and clean
+            except Exception:
+                logger.exception("Could not release the on-demand Beam/Beta9 machine")
+                clean = False
         return clean
 
     def _prepare_volume_shutdown(self, instance: _PodInstance) -> bool:
         """Confirm completed checkpoints were durably published inside the Pod."""
 
+        return self._request_volume_shutdown(instance, endpoint="prepare-shutdown")
+
+    def _finish_remote(self, instance: _PodInstance) -> bool:
+        """Flush checkpoints and ask the backend process to exit with code zero."""
+
+        return self._request_volume_shutdown(instance, endpoint="finish")
+
+    def _request_volume_shutdown(self, instance: _PodInstance, *, endpoint: str) -> bool:
         headers = (
             {"Authorization": f"Bearer {self._resolved_token}"} if self._resolved_token else {}
         )
-        url = f"{_normalize_url(instance.url)}/opentinker/prepare-shutdown"
+        url = f"{_normalize_url(instance.url)}/opentinker/{endpoint}"
         try:
             response = httpx.post(
                 url,
@@ -569,6 +603,66 @@ class BeamComputeAdapter:
             )
         self._checkpoint_verification = verified
         return True
+
+    def _wait_for_task_completion(self, instance: _PodInstance) -> str | None:
+        """Return the terminal status of the naturally exited Pod task."""
+
+        task_id = getattr(instance, "task_id", "")
+        if not task_id:
+            # Older/self-hosted SDKs may not return task metadata. The finish
+            # response has already been sent and Uvicorn exits immediately
+            # afterward, so give the worker a short window to observe exit 0.
+            time.sleep(min(self.poll_interval, 2))
+            return "COMPLETE"
+
+        wait = getattr(instance, "wait", None)
+        if callable(wait):
+            try:
+                status = str(
+                    wait(
+                        timeout=min(self.wait_timeout, 120),
+                        poll_interval=self.poll_interval,
+                    )
+                ).upper()
+            except Exception as exc:
+                logger.warning("Could not wait for Beam task completion: %s", exc)
+                return None
+            if status != "COMPLETE":
+                logger.error("Beam task %s ended with status %s", task_id, status)
+            return status
+
+        try:
+            from beta9.clients.gateway import ListTasksRequest, StringList
+
+            gateway = instance.gateway_stub
+        except Exception as exc:
+            logger.warning("Could not start Beam task completion check: %s", exc)
+            return None
+
+        deadline = time.monotonic() + min(self.wait_timeout, 120)
+        while time.monotonic() < deadline:
+            try:
+                response = gateway.list_tasks(
+                    ListTasksRequest(
+                        filters={"id": StringList(values=[task_id])},
+                        limit=1,
+                    )
+                )
+                if not response.ok:
+                    raise RuntimeError(response.err_msg)
+                if not response.tasks:
+                    raise RuntimeError(f"task not found: {task_id}")
+                status = str(response.tasks[0].status).upper()
+            except Exception as exc:
+                logger.warning("Could not read Beam task completion status: %s", exc)
+                return None
+            if status in {"COMPLETE", "ERROR", "TIMEOUT", "CANCELLED"}:
+                if status != "COMPLETE":
+                    logger.error("Beam task %s ended with status %s", task_id, status)
+                return status
+            time.sleep(min(self.poll_interval, max(deadline - time.monotonic(), 0)))
+        logger.error("Beam task %s did not complete after graceful shutdown", task_id)
+        return None
 
     @staticmethod
     def _close_client(client: Any) -> None:
@@ -721,7 +815,7 @@ class BeamComputeAdapter:
     ) -> None:
         if exc_value is not None:
             self._announce_exception(exc_value, persist_checkpoints=True)
-        clean = self.stop()
+        clean = self.stop() if exc_type is not None else self.finish()
         if not clean:
             self._announce_cleanup_failure()
         if not clean and exc_type is None:

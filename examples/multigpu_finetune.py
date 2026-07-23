@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -137,6 +138,12 @@ def main() -> None:
         if not inference_text.strip():
             raise RuntimeError("reloaded sampler checkpoint produced an empty response")
         runtime = adapter.refresh_runtime_info()
+        if final_nll >= initial_nll:
+            raise RuntimeError("held-out NLL did not improve")
+        if not math.isclose(reloaded_nll, final_nll, rel_tol=5e-4, abs_tol=1e-3):
+            raise RuntimeError(
+                f"reloaded checkpoint changed held-out NLL: {final_nll} -> {reloaded_nll}"
+            )
 
     summary = {
         "dataset": "HuggingFaceH4/no_robots",
@@ -162,12 +169,6 @@ def main() -> None:
     results_path = output / "results.json"
     results_path.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2), flush=True)
-    if final_nll >= initial_nll:
-        raise RuntimeError("held-out NLL did not improve")
-    if abs(reloaded_nll - final_nll) > 5e-4:
-        raise RuntimeError(
-            f"reloaded checkpoint changed held-out NLL: {final_nll} -> {reloaded_nll}"
-        )
 
 
 if __name__ == "__main__":

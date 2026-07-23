@@ -107,12 +107,17 @@ class FutureStore:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
 
-def create_app(engine: ComputeEngine) -> Any:
+def create_app(
+    engine: ComputeEngine,
+    *,
+    request_shutdown: Callable[[], None] | None = None,
+) -> Any:
     """Build the FastAPI application around a compute engine."""
 
     try:
         from fastapi import FastAPI
         from fastapi.responses import JSONResponse
+        from starlette.background import BackgroundTask
     except ImportError as exc:  # pragma: no cover - only possible in a malformed Pod image
         raise ImportError("The Beam compute server requires fastapi") from exc
 
@@ -177,6 +182,17 @@ def create_app(engine: ComputeEngine) -> Any:
     @app.post("/opentinker/prepare-shutdown")
     def prepare_shutdown() -> dict[str, Any]:
         return engine.prepare_shutdown()
+
+    @app.post("/opentinker/finish")
+    def finish() -> Any:
+        result = engine.prepare_shutdown()
+        background = (
+            BackgroundTask(request_shutdown) if request_shutdown is not None else None
+        )
+        # Starlette runs the background task after the response is sent. This
+        # lets the caller receive the final checkpoint manifest before Uvicorn
+        # exits and the Beam task completes naturally.
+        return JSONResponse(content=result, background=background)
 
     @app.get("/opentinker/runtime")
     def runtime_status() -> dict[str, Any]:
