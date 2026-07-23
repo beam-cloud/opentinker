@@ -24,6 +24,10 @@ def test_example_compute_options_build_a_consistent_adapter() -> None:
             "prod3",
             "--gpu",
             "A16",
+            "--gpu-count",
+            "4",
+            "--interconnect",
+            "nvlink",
             "--pool",
             "training",
             "--volume-name",
@@ -39,6 +43,8 @@ def test_example_compute_options_build_a_consistent_adapter() -> None:
     assert adapter.provider == "beta9"
     assert adapter.profile == "prod3"
     assert adapter.gpu == "A16"
+    assert adapter.gpu_count == 4
+    assert adapter.interconnect == "nvlink"
     assert adapter.pool == "training"
     assert adapter.machine_ttl == "2h"
     assert adapter.volume_name == "checkpoints"

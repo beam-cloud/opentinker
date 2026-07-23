@@ -11,6 +11,7 @@ from tinker_cookbook import model_info, renderers
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from opentinker import BeamComputeAdapter
+from opentinker._distillation import sample_text
 from opentinker._examples import add_compute_arguments, compute_options_from_args, mean_nll
 from opentinker.data import conversation_to_datum
 
@@ -53,6 +54,29 @@ def main() -> None:
         **compute_options_from_args(args),
     )
     with adapter as service_client:
+        if "/sampler_weights/" in args.checkpoint:
+            messages = cast(list[dict[str, str]], dataset[0]["messages"])[:-1]
+            sampler = service_client.create_sampling_client(model_path=args.checkpoint)
+            generated = sample_text(
+                sampler,
+                renderer,
+                tokenizer,
+                messages,
+                max_tokens=128,
+            )
+            if not generated.strip():
+                raise RuntimeError("persisted sampler checkpoint produced an empty response")
+            print(
+                json.dumps(
+                    {
+                        "checkpoint": args.checkpoint,
+                        "fresh_pod_inference": True,
+                        "generated_text": generated,
+                    },
+                    indent=2,
+                )
+            )
+            return
         if args.resume_with_optimizer:
             resumed_client = service_client.create_training_client_from_state_with_optimizer(
                 args.checkpoint

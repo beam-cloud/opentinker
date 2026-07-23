@@ -13,7 +13,7 @@ you selected. No model work is forwarded to Tinker's managed service.
 flowchart LR
     Code["Tinker or Cookbook workflow"] --> Adapter["BeamComputeAdapter"]
     Adapter --> Pod["Tinker-compatible Beam Pod"]
-    Pod --> GPU["Your selected GPU"]
+    Pod --> GPU["One or more GPUs on one machine"]
     GPU --> Volume[("Beam Volume checkpoints")]
 ```
 
@@ -88,7 +88,7 @@ Qwen3-14B teacher         31/32 exact
 distilled Qwen3-0.6B      23/32 exact (71.9%)
 fresh A10G checkpoint     23/32 exact
 verified teacher rows     96/114 attempts
-training NLL              2.654 -> 0.003
+first/last batch NLL      2.654 -> 0.003
 ```
 
 The fresh score came from a second pod after the L40S training pod and
@@ -128,6 +128,11 @@ For example:
 uv run python examples/cookbook_sl_loop.py \
   --profile default --on-demand --gpu H100 --steps 20
 
+# Use every GPU in a 4x machine; fail early unless every pair has NVLink
+uv run python examples/cookbook_sl_loop.py \
+  --profile default --on-demand --gpu H100 \
+  --gpu-count 4 --interconnect nvlink --batch-size 16 --steps 20
+
 # Run the same workflow on a GPU you attached to Beam
 beam pool join opentinker-gpus --gpu H100 --max-gpus 1 --background
 uv run python examples/cookbook_sl_loop.py \
@@ -138,6 +143,17 @@ uv run python examples/cookbook_sl_loop.py \
 the connected GPU automatically, and OpenTinker never releases capacity it
 did not create. See [Bring your own hardware](docs/bring-your-own-hardware.md)
 for private-pool installers, `machine reserve`, and self-hosted Beta9.
+
+`--gpu-count N` is one distributed training job, not N independent Pods.
+Beta9 places all N devices in one container on one machine; OpenTinker launches
+one PyTorch process per GPU and DDP synchronizes LoRA gradients with NCCL. NCCL
+uses NVLink or NVSwitch automatically when the machine has it.
+`--interconnect nvlink` turns that preference into a startup requirement.
+The base model is replicated, so it must fit on each GPU; use a global batch at
+least as large as the GPU count to keep every rank useful.
+[`multigpu_finetune.py`](examples/multigpu_finetune.py) is the end-to-end
+reference: real No Robots data, held-out NLL, Volume checkpoints, and a
+checkpoint reload assertion.
 
 ## Monitor, interrupt, and resume
 
@@ -158,6 +174,11 @@ handles backed by a persistent Beam Volume:
 tinker://<model-id>/weights/<name>
 tinker://<model-id>/sampler_weights/<name>
 ```
+
+Checkpoint publication is verified in the Pod. OpenTinker hashes the bytes
+written to the mounted Volume, places that SHA-256 on the same geesefs object
+upload, calls `fsync()`, and requires the remote ETag before reporting success.
+It does not download the checkpoint again to verify it.
 
 Use those handles unchanged with `load_state()`,
 `create_training_client_from_state_with_optimizer()`, or
@@ -196,15 +217,19 @@ package's public API while adding `BeamComputeAdapter`.
 The single-node backend supports upstream Tinker training and sampling
 clients, token-input cross-entropy and importance-sampling losses, PEFT LoRA,
 AdamW, state/optimizer resume, sampler checkpoints, sequence-level
-distillation, and the Cookbook supervised loop.
+distillation, the Cookbook supervised loop, and data-parallel training across
+multiple GPUs. Sampling requests with several completions are also distributed
+across the allocated GPUs.
 
-Distributed training, multimodal inputs, arbitrary custom loss functions,
-logit-level distillation, and the full Tinker account-management API are not
-implemented. Adapter contexts are process-global and must not overlap.
+Multi-node training, parameter sharding/tensor parallelism, multimodal inputs,
+arbitrary custom loss functions, logit-level distillation, and the full Tinker
+account-management API are not implemented. Adapter contexts are
+process-global and must not overlap.
 
 More detail:
 
 - [Examples](examples/)
+- [Fine-tuning and distillation: the ML view](docs/ml-training.md)
 - [System diagrams](docs/system-diagrams.md)
 - [Data preparation](docs/data-preparation.md)
 - [Bring your own hardware](docs/bring-your-own-hardware.md)

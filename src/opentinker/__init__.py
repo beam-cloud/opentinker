@@ -7,7 +7,7 @@ from typing import Any
 
 import tinker as _tinker
 
-from .adapter import BeamComputeAdapter, ProviderName
+from .adapter import BeamComputeAdapter, InterconnectPolicy, ProviderName
 
 try:
     __version__ = version("opentinker")
@@ -25,4 +25,4 @@ def __dir__() -> list[str]:
     return sorted({*globals(), *dir(_tinker)})
 
 
-__all__ = ["BeamComputeAdapter", "ProviderName"]
+__all__ = ["BeamComputeAdapter", "InterconnectPolicy", "ProviderName"]

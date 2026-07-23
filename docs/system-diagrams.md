@@ -20,14 +20,15 @@ flowchart LR
     subgraph Pod["Authorized Beam Pod"]
         Endpoint["Tinker-compatible HTTP endpoint"]
         Engine["Transformers plus PEFT engine"]
+        DDP["torchrun plus DDP/NCCL"]
         Base["Hugging Face base model"]
         LoRA["Trainable LoRA adapter"]
-        Endpoint --> Engine
+        Endpoint --> DDP --> Engine
         Base --> Engine
         LoRA <--> Engine
     end
 
-    GPU["Selected GPU"]
+    GPU["1-N GPUs on one machine"]
     Volume[("Beam Volume")]
 
     User --> Adapter
@@ -60,15 +61,25 @@ flowchart LR
   contract; it is not a hosted Tinker training endpoint.
 - **Transformers/PEFT** loads the Hugging Face base model and owns
   the trainable LoRA adapter, gradients, AdamW state, and generation calls.
-- **GPU execution** covers the forward pass, backward pass,
-  optimizer work, and token generation.
+- **Multi-GPU execution** starts one process and one model replica per GPU.
+  DDP partitions a global Tinker batch and NCCL all-reduces LoRA gradients.
+  NCCL selects NVLink/NVSwitch automatically when the machine exposes it.
+- **GPU execution** covers the forward pass, backward pass, optimizer work,
+  and token generation.
 - **Durable storage** uses a Beam Volume for adapter weights and optimizer state
   after the Pod exits. `tinker://` is the SDK-facing handle for the
-  corresponding Volume directory.
+  corresponding Volume directory. The Pod hashes each staged file, attaches
+  the digest to its object metadata, and waits on `fsync()` plus the remote
+  ETag; verification does not relay checkpoint bytes through the client.
 
 See [Bring your own hardware](bring-your-own-hardware.md) for the exact
 serverless, on-demand reservation, private pool, installer, and self-hosted
 Beta9 commands.
+
+For a single GPU, the DDP layer collapses to the ordinary in-process engine.
+For multiple GPUs, Beta9 schedules the whole Pod on one worker; OpenTinker does
+not span machines. `interconnect="nvlink"` adds a topology gate before the
+endpoint becomes healthy.
 
 ## Supervised fine-tuning
 

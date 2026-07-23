@@ -6,6 +6,9 @@ normal sampling, datum, training, and checkpoint APIs; Beam supplies the GPU.
 
 The complete example is
 [`examples/distill_support_router.py`](../examples/distill_support_router.py).
+For the objective functions, token masking, LoRA parameterization, and the
+difference between sequence-level and logit distillation, see
+[Fine-tuning and distillation: the ML view](ml-training.md).
 
 ## The task
 
@@ -124,9 +127,11 @@ reservation, and reloaded the sampler checkpoint in a separate A10G pod:
 | Distilled Qwen3-0.6B | 23/32 (71.9%) |
 | Same checkpoint in fresh A10G pod | 23/32 (71.9%) |
 
-Training NLL fell from `2.654` to `0.003`. All 32 evaluation messages came
-from the untouched Banking77 test split; none appeared in teacher generation
-or student training.
+The first and last logged training-minibatch NLL values were `2.654` and
+`0.003`; because they came from different shuffled minibatches, they are not a
+held-out before/after comparison. All 32 evaluation messages came from the
+untouched Banking77 test split; none appeared in teacher generation or student
+training.
 
 ## What the A/B proves
 

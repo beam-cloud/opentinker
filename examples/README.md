@@ -7,11 +7,30 @@ no flags              -> Beam serverless A10G
 --on-demand           -> Beam's interactive hardware picker
 --on-demand --gpu X   -> reserve matching marketplace capacity
 --pool my-gpus        -> use your attached or pre-reserved hardware
+--gpu-count N         -> DDP across N GPUs on one machine
+--interconnect nvlink -> require all-pairs NVLink/NVSwitch connectivity
 ```
 
 Every run prints its Beam dashboard URL and attach command as soon as the Pod
 exists. Ctrl+C stops the Pod, preserves completed Volume checkpoints, and
 releases only capacity the adapter reserved.
+
+## Multi-GPU acceptance run
+
+[`multigpu_finetune.py`](multigpu_finetune.py) trains a 4B model on 128 real
+No Robots conversations, evaluates on a disjoint set, writes state and sampler
+checkpoints, reloads the state into a new Tinker training client, and requires
+the reloaded NLL to match:
+
+```bash
+uv run python examples/multigpu_finetune.py \
+  --profile default --pool four-l40s \
+  --gpu-count 4 --batch-size 16 --cpu 16 --memory 64Gi
+```
+
+Use `--on-demand` instead of `--pool` to select the 4x machine in Beam's
+picker. Add `--interconnect nvlink` only for a linked machine; the default
+records either `nvlink` or `pcie` in the result without rejecting it.
 
 ## Real-world teacher-to-student distillation
 
@@ -70,6 +89,9 @@ uv run python examples/evaluate_checkpoint.py \
   tinker://<model-id>/weights/<name> \
   --profile default --gpu A10G --examples 8
 ```
+
+Pass a `tinker://.../sampler_weights/...` handle to the same command to load
+the persisted adapter in a fresh Pod and run generation instead.
 
 See [`docs/data-preparation.md`](../docs/data-preparation.md) for schemas,
 rendering, loss masks, and preprocessing helpers.

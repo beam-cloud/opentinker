@@ -131,8 +131,10 @@ renderers may support only a subset of these modes and will report unsupported
 choices before training starts.
 
 Use `reduction="mean"` (the default) to normalize loss weights per example.
-Use `reduction="none"` only when intentionally weighting longer responses more
-heavily.
+OpenTinker's current engine also normalizes each datum internally, so
+`reduction="none"` does not give longer examples more optimizer-gradient
+weight. It does make aggregate NLL reporting token-weighted when raw binary
+masks are used; see [the ML guide](ml-training.md#24-per-example-normalization).
 
 Always inspect truncation behavior. A small `max_length` can remove the final
 assistant answer and leave little or no useful loss. Bucket or filter unusually

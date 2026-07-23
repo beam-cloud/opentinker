@@ -26,6 +26,20 @@ def add_compute_arguments(
         "--gpu",
         help="GPU type (default: A10G; auto-detected for --pool or an unfiltered picker)",
     )
+    group.add_argument(
+        "--gpu-count",
+        type=int,
+        default=1,
+        help="GPUs on one machine; values above 1 use PyTorch DDP and NCCL",
+    )
+    group.add_argument(
+        "--interconnect",
+        choices=("auto", "nvlink"),
+        default="auto",
+        help="auto-detect links, or require all allocated GPUs to use NVLink/NVSwitch",
+    )
+    group.add_argument("--cpu", type=float, default=4, help="Pod CPU cores")
+    group.add_argument("--memory", default="16Gi", help="Pod memory, for example 64Gi")
     hardware = group.add_mutually_exclusive_group()
     hardware.add_argument(
         "--pool",
@@ -47,6 +61,10 @@ def compute_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "provider": args.provider,
         "profile": args.profile,
         "gpu": args.gpu,
+        "gpu_count": args.gpu_count,
+        "interconnect": args.interconnect,
+        "cpu": args.cpu,
+        "memory": args.memory,
         "pool": args.pool,
         "on_demand": args.on_demand,
         "machine_ttl": args.machine_ttl,

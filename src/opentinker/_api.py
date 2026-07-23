@@ -13,7 +13,6 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -43,9 +42,9 @@ class ComputeEngine(Protocol):
 
     def sample(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
-    def prepare_shutdown(self) -> dict[str, Any]: ...
+    def runtime_status(self, request: dict[str, Any] | None = None) -> dict[str, Any]: ...
 
-    def export_checkpoint(self, request: dict[str, Any]) -> Path: ...
+    def prepare_shutdown(self) -> dict[str, Any]: ...
 
 
 class FutureStore:
@@ -113,8 +112,7 @@ def create_app(engine: ComputeEngine) -> Any:
 
     try:
         from fastapi import FastAPI
-        from fastapi.responses import FileResponse, JSONResponse
-        from starlette.background import BackgroundTask
+        from fastapi.responses import JSONResponse
     except ImportError as exc:  # pragma: no cover - only possible in a malformed Pod image
         raise ImportError("The Beam compute server requires fastapi") from exc
 
@@ -126,6 +124,9 @@ def create_app(engine: ComputeEngine) -> Any:
             yield
         finally:
             futures.close()
+            close = getattr(engine, "close", None)
+            if close is not None:
+                close()
 
     app = FastAPI(
         title="OpenTinker Beam compute backend",
@@ -135,8 +136,11 @@ def create_app(engine: ComputeEngine) -> Any:
     )
 
     @app.get("/api/v1/healthz")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "runtime": getattr(engine, "runtime_info", {"strategy": "unknown"}),
+        }
 
     @app.get("/api/v1/get_server_capabilities")
     def capabilities() -> dict[str, list[dict[str, Any]]]:
@@ -174,15 +178,9 @@ def create_app(engine: ComputeEngine) -> Any:
     def prepare_shutdown() -> dict[str, Any]:
         return engine.prepare_shutdown()
 
-    @app.post("/opentinker/export-checkpoint")
-    def export_checkpoint(request: dict[str, Any]) -> Any:
-        archive = engine.export_checkpoint(request)
-        return FileResponse(
-            archive,
-            media_type="application/gzip",
-            filename=archive.name,
-            background=BackgroundTask(archive.unlink, missing_ok=True),
-        )
+    @app.get("/opentinker/runtime")
+    def runtime_status() -> dict[str, Any]:
+        return engine.runtime_status()
 
     @app.post("/api/v1/create_sampling_session")
     def create_sampling_session(request: dict[str, Any]) -> dict[str, Any]:

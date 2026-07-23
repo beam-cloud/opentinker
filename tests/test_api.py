@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -68,16 +67,15 @@ class ContractEngine:
             "prompt_cache_hit_tokens": 0,
         }
 
+    def runtime_status(self, request: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {"strategy": "single", "request": request}
+
     def prepare_shutdown(self) -> dict[str, Any]:
         return {
             "checkpoint_saved": False,
-            "wait_seconds": 0.0,
             "volume_paths": [],
             "checkpoints": [],
         }
-
-    def export_checkpoint(self, request: dict[str, Any]) -> Path:
-        raise NotImplementedError(request)
 
 
 async def retrieve(client: httpx.AsyncClient, future: dict[str, Any]) -> dict[str, Any]:
@@ -98,7 +96,9 @@ async def test_owned_server_implements_tinker_contract() -> None:
     transport = httpx.ASGITransport(app=create_app(ContractEngine()))
     client = httpx.AsyncClient(transport=transport, base_url="http://test")
 
-    assert (await client.get("/api/v1/healthz")).json() == {"status": "ok"}
+    health = (await client.get("/api/v1/healthz")).json()
+    assert health["status"] == "ok"
+    assert health["runtime"]["strategy"] == "unknown"
     capabilities = (await client.get("/api/v1/get_server_capabilities")).json()
     assert capabilities["supported_models"][0]["model_name"] == "Qwen/Qwen3-0.6B"
     config = (await client.post("/api/v1/client/config", json={"sdk_version": "test"})).json()
@@ -118,7 +118,6 @@ async def test_owned_server_implements_tinker_contract() -> None:
     shutdown = (await client.post("/opentinker/prepare-shutdown")).json()
     assert shutdown == {
         "checkpoint_saved": False,
-        "wait_seconds": 0.0,
         "volume_paths": [],
         "checkpoints": [],
     }

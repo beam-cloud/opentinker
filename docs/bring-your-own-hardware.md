@@ -26,6 +26,48 @@ type from the connected machines, so there is no duplicated `--gpu` setting to
 keep synchronized. Pass `--gpu` explicitly only when a pool advertises more
 than one GPU type or you want an additional constraint.
 
+## Multi-GPU and NVLink
+
+Request multiple GPUs on one machine with the same options in every example:
+
+```bash
+uv run python examples/finetune_jsonl.py ./my-data.jsonl \
+  --profile default --on-demand --gpu H100 \
+  --gpu-count 4 --interconnect auto --batch-size 16
+```
+
+`gpu_count=4` is passed directly to the Beta9 Pod. The Beta9 scheduler finds
+one worker with four free GPUs and the worker exposes those four devices to
+one container. OpenTinker then starts four `torchrun` processes, partitions
+each Tinker batch, and uses DDP/NCCL to synchronize LoRA gradients. A request
+never combines one GPU from each of four machines.
+
+NCCL reads the CUDA topology and automatically uses NVLink or NVSwitch when
+the selected machine provides it. The default `--interconnect auto` works on
+both linked and ordinary PCIe systems. Use `--interconnect nvlink` when the
+job must not silently run over PCIe:
+
+```python
+with tinker.BeamComputeAdapter(
+    base_model="Qwen/Qwen3-8B",
+    profile="default",
+    pool="four-h100s",
+    gpu_count=4,
+    interconnect="nvlink",
+):
+    ...
+```
+
+Before serving traffic, OpenTinker checks the visible device count and parses
+`nvidia-smi topo -m`. The strict policy requires direct NVLink/NVSwitch
+connectivity for every allocated GPU pair. The backend health response records
+the device names, pair counts, interconnect classification, and NCCL backend.
+
+This is data parallelism: each GPU holds a full base model and one LoRA
+replica. More GPUs increase batch throughput but do not make a too-large model
+fit. Use at least as many examples per global batch as GPUs; with fewer
+examples, DDP must keep idle ranks in the collective for correctness.
+
 ## 1. Use serverless capacity
 
 With no hardware flags, examples request an A10G from Beam's serverless pool:
@@ -70,7 +112,7 @@ The shortest path is to run this on the GPU host:
 ```bash
 beam pool join opentinker-gpus \
   --gpu H100 \
-  --max-gpus 1 \
+  --max-gpus 8 \
   --background
 ```
 
@@ -128,7 +170,7 @@ OpenTinker:
 ```bash
 uv sync --extra beta9 --extra examples
 
-beta9 pool join opentinker-gpus --gpu H100 --max-gpus 1 --background
+beta9 pool join opentinker-gpus --gpu H100 --max-gpus 8 --background
 
 uv run python examples/finetune_jsonl.py ./my-data.jsonl \
   --provider beta9 --profile my-cluster --pool opentinker-gpus
@@ -144,6 +186,8 @@ for cluster-side setup and advanced agent controls.
 - `--pool` means you own the pool; OpenTinker never deletes or releases it.
 - No hardware flags mean A10G serverless.
 - A private pool must have at least one connected GPU machine before startup.
+- A multi-GPU request must fit on one connected machine; OpenTinker rejects a
+  pool whose largest machine has fewer than `gpu_count` devices.
 - A homogeneous pool needs only `--pool`; a heterogeneous pool also needs
   `--gpu`.
 - Checkpoints use the same Beam Volume regardless of where the GPU lives.
@@ -163,8 +207,8 @@ tracking.
 
 Ctrl+C stops the local workflow because that process is what issues Tinker's
 forward, backward, optimizer, and sampling requests. During shutdown,
-OpenTinker flushes checkpoints that have already been saved, terminates the
-Pod, and releases only an adapter-owned `--on-demand` reservation. A machine
-attached through `--pool` remains yours. If any cleanup operation fails, the
-terminal output repeats the dashboard link and prints exact manual stop and
-release commands.
+OpenTinker confirms the in-Pod durability proofs for checkpoints that have
+already been saved, terminates the Pod, and releases only an adapter-owned
+`--on-demand` reservation. A machine attached through `--pool` remains yours.
+If any cleanup operation fails, the terminal output repeats the dashboard link
+and prints exact manual stop and release commands.

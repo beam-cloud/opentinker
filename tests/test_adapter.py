@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import contextlib
 import json
-import tarfile
 from importlib.metadata import version
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -95,8 +93,10 @@ def fake_provider(
         def __init__(self, **kwargs: Any) -> None:
             pod_calls.append(kwargs)
             self.config_context = SimpleNamespace(token=context_token)
+            self.pool_config = SimpleNamespace(fallback="")
 
         def create(self) -> FakePodInstance:
+            pod_calls[-1]["configured_pool_fallback"] = self.pool_config.fallback
             return pod_instance
 
     provider.__dict__["Image"] = FakeImage
@@ -118,7 +118,7 @@ def patch_adapter_dependencies(
 
     monkeypatch.setattr(beam_module, "ServiceClient", service_client)
     monkeypatch.setattr(BeamComputeAdapter, "_load_provider", lambda _self: provider)
-    monkeypatch.setattr(BeamComputeAdapter, "_get_checkpoint_export_plan", lambda *_args: [])
+    monkeypatch.setattr(BeamComputeAdapter, "_prepare_volume_shutdown", lambda *_args: True)
     return clients
 
 
@@ -138,6 +138,7 @@ def test_starts_backend_and_returns_normal_client(
         secrets=("HF_TOKEN",),
         env={"HF_HUB_ENABLE_HF_TRANSFER": "1"},
     )
+    monkeypatch.setattr(adapter, "_pool_hardware", lambda _pool: ("H100", 8))
     client = adapter.start(wait=False)
 
     monitoring = capsys.readouterr().err
@@ -160,20 +161,23 @@ def test_starts_backend_and_returns_normal_client(
     assert options["cpu"] == 4
     assert options["memory"] == "16Gi"
     assert options["pool"] == "training"
+    assert options["configured_pool_fallback"] == "wait"
     assert options["allow_marketplace"] is True
     assert options["secrets"] == ["HF_TOKEN"]
     assert options["env"] == {
         "OPENTINKER_BASE_MODEL": "Qwen/Qwen3-8B",
         "OPENTINKER_CHECKPOINT_ROOT": "/volumes/tinker-data/checkpoints",
         "OPENTINKER_VOLUME_NAME": "tinker-checkpoints",
-        "OPENTINKER_VOLUME_SYNC_SECONDS": "60",
         "OPENTINKER_MAX_LENGTH": "8192",
         "OPENTINKER_PORT": "8000",
+        "OPENTINKER_GPU_COUNT": "2",
+        "OPENTINKER_INTERCONNECT": "auto",
         "OPENTINKER_SAMPLING_GPU": "1",
         "OPENTINKER_TRUST_REMOTE_CODE": "0",
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
     }
-    assert options["entrypoint"][-1].endswith("python -m opentinker._server")
+    assert "torchrun --nnodes=1 --node-rank=0" in options["entrypoint"][-1]
+    assert "--master-addr=127.0.0.1 --master-port=29500" in options["entrypoint"][-1]
     assert options["volumes"][0].mount_path == "/tinker-data"
 
     assert adapter.stop() is True
@@ -267,24 +271,30 @@ def test_context_interrupt_prints_dashboard_and_cleans_up(
     assert instance.terminate_calls == 1
 
 
-def test_stop_gets_live_checkpoint_export_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_prepare_shutdown_uses_in_pod_volume_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-0.6B")
     adapter._resolved_token = "provider-token"
 
-    def post(url: str, *, headers: dict[str, str], timeout: int) -> httpx.Response:
+    def post(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
         assert url == "https://pod.example.test/opentinker/prepare-shutdown"
         assert headers == {"Authorization": "Bearer provider-token"}
-        assert timeout == 10
+        assert timeout == 1800
         return httpx.Response(
             200,
             json={
                 "checkpoint_saved": True,
-                "wait_seconds": 12.5,
                 "volume_paths": ["tinker-checkpoints/checkpoints/model/weights/final"],
                 "checkpoints": [
                     {
                         "uri": "tinker://model/weights/final",
                         "volume_path": "tinker-checkpoints/checkpoints/model/weights/final",
+                        "manifest_sha256": "abc123",
+                        "verified": True,
+                        "verification": "geesefs-fsync-sha256",
+                        "file_count": 4,
                     }
                 ],
             },
@@ -292,95 +302,17 @@ def test_stop_gets_live_checkpoint_export_plan(monkeypatch: pytest.MonkeyPatch) 
         )
 
     monkeypatch.setattr(beam_module.httpx, "post", post)
-
-    checkpoints = adapter._get_checkpoint_export_plan(FakePodInstance())
-
-    assert checkpoints == [
-        {
-            "uri": "tinker://model/weights/final",
-            "volume_path": "tinker-checkpoints/checkpoints/model/weights/final",
-        }
-    ]
-
-
-def test_persists_live_checkpoint_through_beam_cli(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    payload = tmp_path / "payload" / "checkpoint"
-    (payload / "model-1").mkdir(parents=True)
-    (payload / "opentinker.json").write_text("{}")
-    (payload / "model-1" / "adapter_model.bin").write_bytes(b"trained-weights")
-    archive = tmp_path / "checkpoint.tar.gz"
-    with tarfile.open(archive, "w:gz") as handle:
-        handle.add(payload, arcname="checkpoint")
-    archive_bytes = archive.read_bytes()
-
-    def stream(
-        method: str,
-        url: str,
-        *,
-        headers: dict[str, str],
-        json: dict[str, str],
-        timeout: httpx.Timeout,
-    ) -> Any:
-        assert method == "POST"
-        assert url == "https://pod.example.test/opentinker/export-checkpoint"
-        assert headers == {"Authorization": "Bearer provider-token"}
-        assert json == {"path": "tinker://model-1/weights/final"}
-        assert timeout.connect == 10
-        return contextlib.closing(
-            httpx.Response(
-                200,
-                content=archive_bytes,
-                request=httpx.Request(method, url),
-            )
-        )
-
-    commands: list[list[str]] = []
-
-    def run(command: list[str], **kwargs: Any) -> SimpleNamespace:
-        commands.append(command)
-        source = Path(command[-2])
-        assert source.name == "checkpoint"
-        assert (source / "opentinker.json").read_text() == "{}"
-        assert (source / "model-1" / "adapter_model.bin").read_bytes() == b"trained-weights"
-        assert kwargs["check"] is False
-        assert kwargs["text"] is True
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-0.6B", profile="prod3")
-    adapter._resolved_token = "provider-token"
-    monkeypatch.setattr(beam_module.httpx, "stream", stream)
-    monkeypatch.setattr(beam_module.shutil, "which", lambda _name: "/usr/local/bin/beam")
-    monkeypatch.setattr(beam_module.subprocess, "run", run)
     monkeypatch.setattr(
-        adapter,
-        "_wait_for_published_volume_paths",
-        lambda paths: list(paths) == ["tinker-checkpoints/checkpoints/model-1/weights/final"],
+        beam_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("checkpoint verification must not download Volume objects")
+        ),
     )
 
-    persisted = adapter._persist_volume_checkpoints(
-        FakePodInstance(),
-        [
-            {
-                "uri": "tinker://model-1/weights/final",
-                "volume_path": "tinker-checkpoints/checkpoints/model-1/weights/final",
-            }
-        ],
-    )
-
-    assert persisted is True
-    assert commands == [
-        [
-            "/usr/local/bin/beam",
-            "--context",
-            "prod3",
-            "cp",
-            commands[0][-2],
-            "beam://tinker-checkpoints/checkpoints/model-1/weights/final",
-        ]
-    ]
+    assert adapter._prepare_volume_shutdown(FakePodInstance()) is True
+    assert adapter.checkpoint_verification[0]["verification"] == "geesefs-fsync-sha256"
+    assert "zero downloaded" in capsys.readouterr().err
 
 
 def test_context_scopes_cookbook_created_service_clients(
@@ -430,7 +362,7 @@ def test_builds_owned_backend_image(monkeypatch: pytest.MonkeyPatch) -> None:
         "FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime\n"
         "RUN python -m pip install --no-cache-dir tinker==9.9.9"
     )
-    assert "'peft>=0.14,<1'" in dockerfile
+    assert "'peft>=0.18,<0.19'" in dockerfile
     assert "'transformers>=4.57.6,<5'" in dockerfile
     assert "'fastapi>=0.115,<1'" in dockerfile
     assert "'uvicorn[standard]>=0.34,<1'" in dockerfile
@@ -444,6 +376,7 @@ def test_builds_owned_backend_image(monkeypatch: pytest.MonkeyPatch) -> None:
         "opentinker/__init__.py",
         "opentinker/_api.py",
         "opentinker/_distillation.py",
+        "opentinker/_distributed.py",
         "opentinker/_engine.py",
         "opentinker/_examples.py",
         "opentinker/_server.py",
@@ -468,7 +401,21 @@ def test_default_image_uses_running_tinker_version(monkeypatch: pytest.MonkeyPat
 def test_waits_for_health_before_creating_client(monkeypatch: pytest.MonkeyPatch) -> None:
     provider, _, _ = fake_provider()
     clients = patch_adapter_dependencies(monkeypatch, provider)
-    responses = [httpx.Response(503, text="loading"), httpx.Response(200, json={"status": "ok"})]
+    responses = [
+        httpx.Response(503, text="loading"),
+        httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "runtime": {
+                    "gpu_count": 1,
+                    "gpu_names": ["NVIDIA A10G"],
+                    "strategy": "single",
+                    "interconnect": "single",
+                },
+            },
+        ),
+    ]
 
     def get(url: str, *, headers: dict[str, str], timeout: int) -> httpx.Response:
         assert url == "https://pod.example.test/api/v1/healthz"
@@ -480,9 +427,16 @@ def test_waits_for_health_before_creating_client(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(beam_module.httpx, "get", get)
     monkeypatch.setattr(beam_module.time, "sleep", lambda _: None)
 
-    BeamComputeAdapter(base_model="Qwen/Qwen3-8B").start()
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B")
+    adapter.start()
 
     assert len(clients) == 1
+    assert adapter.runtime_info == {
+        "gpu_count": 1,
+        "gpu_names": ["NVIDIA A10G"],
+        "strategy": "single",
+        "interconnect": "single",
+    }
 
 
 def test_wait_failure_terminates_pod(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -504,12 +458,12 @@ def test_failed_start_skips_checkpoint_export(monkeypatch: pytest.MonkeyPatch) -
     patch_adapter_dependencies(monkeypatch, provider)
     export_calls = 0
 
-    def export_plan(*_args: Any) -> list[dict[str, str]]:
+    def export_plan(*_args: Any) -> bool:
         nonlocal export_calls
         export_calls += 1
-        return []
+        return True
 
-    monkeypatch.setattr(BeamComputeAdapter, "_get_checkpoint_export_plan", export_plan)
+    monkeypatch.setattr(BeamComputeAdapter, "_prepare_volume_shutdown", export_plan)
     monkeypatch.setattr(
         BeamComputeAdapter,
         "_wait_until_ready",
@@ -542,7 +496,7 @@ def test_cleanup_attempts_every_resource_after_close_failure(
         "_close_client",
         lambda _client: (_ for _ in ()).throw(RuntimeError("close failed")),
     )
-    monkeypatch.setattr(adapter, "_get_checkpoint_export_plan", lambda _instance: [])
+    monkeypatch.setattr(adapter, "_prepare_volume_shutdown", lambda _instance: True)
     monkeypatch.setattr(adapter, "_release_reserved_machine", release)
 
     assert adapter.stop() is False
@@ -584,7 +538,17 @@ def test_on_demand_machine_is_reserved_and_released(monkeypatch: pytest.MonkeyPa
         if "list" in command:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps({"machines": [{"pool_name": "opentinker-test", "gpu": "A6000"}]}),
+                stdout=json.dumps(
+                    {
+                        "machines": [
+                            {
+                                "pool_name": "opentinker-test",
+                                "gpu": "A6000",
+                                "gpu_count": 1,
+                            }
+                        ]
+                    }
+                ),
                 stderr="",
             )
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
@@ -688,6 +652,63 @@ def test_existing_pool_discovers_its_gpu(monkeypatch: pytest.MonkeyPatch) -> Non
     assert pod_calls[0]["pool"] == "my-hardware"
     assert adapter.stop() is True
     assert instance.terminate_calls == 1
+
+
+def test_multi_gpu_pool_requires_one_machine_with_enough_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, pod_calls, _ = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(beam_module.shutil, "which", lambda _name: "/usr/local/bin/beam")
+    monkeypatch.setattr(
+        beam_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "machines": [
+                        {
+                            "pool_name": "h100s",
+                            "gpu": "H100,H100,H100,H100",
+                            "gpu_count": 4,
+                        },
+                        {
+                            "pool_name": "h100s",
+                            "gpu": "H100,H100,H100,H100",
+                            "gpu_count": 4,
+                        },
+                    ]
+                }
+            ),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="at most 4 GPUs on one machine"):
+        BeamComputeAdapter(
+            base_model="Qwen/Qwen3-0.6B",
+            pool="h100s",
+            gpu_count=8,
+        ).start(wait=False)
+
+    assert pod_calls == []
+
+
+def test_multi_gpu_options_launch_torchrun_and_require_nvlink() -> None:
+    adapter = BeamComputeAdapter(
+        base_model="Qwen/Qwen3-0.6B",
+        gpu="H100",
+        gpu_count=8,
+        interconnect="nvlink",
+    )
+
+    entrypoint = adapter._entrypoint()[-1]
+    assert "torchrun --nnodes=1 --node-rank=0" in entrypoint
+    assert "--master-addr=127.0.0.1 --master-port=29500" in entrypoint
+    assert '--nproc-per-node="${OPENTINKER_GPU_COUNT}"' in entrypoint
+    assert adapter._server_environment()["OPENTINKER_GPU_COUNT"] == "8"
+    assert adapter._server_environment()["OPENTINKER_INTERCONNECT"] == "nvlink"
 
 
 def test_existing_pool_without_connected_hardware_fails_clearly(
@@ -894,9 +915,12 @@ def test_cancelling_on_demand_picker_does_not_create_or_release_pool(
         ({"cpu": 0}, "cpu"),
         ({"memory": 0}, "memory"),
         ({"gpu": ""}, "gpu"),
+        ({"gpu_count": 0}, "gpu_count"),
+        ({"interconnect": "infiniband"}, "interconnect"),
+        ({"pool_fallback": "internal"}, "pool_fallback"),
         ({"max_length": 0}, "max_length"),
         ({"volume_mount_path": "relative"}, "absolute"),
-        ({"volume_sync_seconds": -1}, "volume_sync_seconds"),
+        ({"volume_verify_timeout": 0}, "volume_verify_timeout"),
         ({"port": 0}, "port"),
         ({"wait_timeout": 0}, "wait_timeout"),
         ({"poll_interval": 0}, "poll_interval"),
