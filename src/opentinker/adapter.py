@@ -4,27 +4,24 @@
 
 from __future__ import annotations
 
-import importlib
-import importlib.metadata
-import json
 import logging
 import os
-import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from types import ModuleType, TracebackType
 from typing import Any, Literal, Protocol, cast
 
 import httpx
 import tinker as tinker_module
 from tinker.lib.public_interfaces.service_client import ServiceClient
+
+from ._hardware import HardwareManager
+from ._image import BackendImageSpec, build_backend_image
+from ._provider import load_provider
 
 ProviderName = Literal["beam", "beta9"]
 InterconnectPolicy = Literal["auto", "nvlink"]
@@ -35,8 +32,6 @@ _DEFAULT_VOLUME_MOUNT = "/tinker-data"
 _DEFAULT_BASE_IMAGE = "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime"
 _CLIENT_API_KEY = "tml-beam-compute"
 _BEAM_CONTAINERS_DASHBOARD = "https://platform.beam.cloud/containers"
-_REPRODUCIBLE_MTIME = 315619200  # 1980-01-02 UTC; ZIP-safe in western timezones.
-
 logger = logging.getLogger(__name__)
 
 
@@ -132,6 +127,7 @@ class BeamComputeAdapter:
     _client: ServiceClient | None = field(default=None, init=False, repr=False)
     _provider_context: Any | None = field(default=None, init=False, repr=False)
     _resolved_token: str | None = field(default=None, init=False, repr=False)
+    _hardware: HardwareManager | None = field(default=None, init=False, repr=False)
     _reserved_pool: str | None = field(default=None, init=False, repr=False)
     _last_container_id: str | None = field(default=None, init=False, repr=False)
     _last_dashboard_url: str | None = field(default=None, init=False, repr=False)
@@ -285,6 +281,7 @@ class BeamComputeAdapter:
             raise RuntimeError("this adapter already has a running backend")
         self._checkpoint_verification.clear()
         provider = self._load_provider()
+        self._hardware = self._new_hardware_manager()
         try:
             image = self.image if self.image is not None else self._build_image(provider)
             if self.on_demand:
@@ -294,24 +291,10 @@ class BeamComputeAdapter:
                 build_result = image.build()
                 if not build_result.success:
                     raise RuntimeError("failed to build Beam/Beta9 image")
-                self._reserve_machine()
-            elif self.pool is not None:
-                pool_gpu, pool_gpu_count = self._pool_hardware(self.pool)
-                if pool_gpu is None:
-                    raise RuntimeError(
-                        f"pool {self.pool!r} has no connected machines; attach hardware with "
-                        f"`{self.provider} pool join {self.pool}` or choose another pool"
-                    )
-                if self.gpu is None:
-                    self.gpu = pool_gpu
-                elif isinstance(self.gpu, str) and self.gpu != pool_gpu:
-                    raise RuntimeError(
-                        f"pool {self.pool!r} provides {pool_gpu}, but OpenTinker requested "
-                        f"{self.gpu}"
-                    )
-                self._validate_pool_gpu_count(self.pool, pool_gpu_count)
-            if self.gpu is None:
-                raise RuntimeError("no GPU was selected for the Beam/Beta9 Pod")
+            selection = self._hardware.select()
+            self.gpu = selection.gpu
+            self.pool = selection.pool
+            self._reserved_pool = self._hardware.owned_pool
             primary_volume = self.volume
             if primary_volume is None:
                 primary_volume = provider.Volume(
@@ -356,11 +339,23 @@ class BeamComputeAdapter:
         self._last_dashboard_url = management_url or None
 
     def _operator_command(self, *arguments: str) -> str:
-        command = [self.provider]
-        if self.profile is not None:
-            command.extend(["--context", self.profile])
-        command.extend(arguments)
-        return shlex.join(command)
+        manager = self._hardware or self._new_hardware_manager()
+        return manager.operator_command(*arguments)
+
+    def _new_hardware_manager(self) -> HardwareManager:
+        return HardwareManager(
+            provider=self.provider,
+            profile=self.profile,
+            gpu=self.gpu,
+            gpu_count=int(self.gpu_count or 1),
+            pool=self.pool,
+            on_demand=self.on_demand,
+            machine_ttl=self.machine_ttl,
+            machine_name=self.machine_name,
+            release_machine=self.release_machine,
+            run=subprocess.run,
+            find_executable=shutil.which,
+        )
 
     def _announce_pod(self) -> None:
         """Print the live monitoring handoff before waiting for model readiness."""
@@ -656,225 +651,29 @@ class BeamComputeAdapter:
         return ["/bin/bash", "-lc", script]
 
     def _build_image(self, provider: ModuleType) -> Any:
-        tinker_version = importlib.metadata.version("tinker")
-        packages = [
-            self.tinker_requirement or f"tinker=={tinker_version}",
-            # PEFT 0.19 expects Transformers tensor-parallel APIs that are not
-            # present in the stable 4.x line pinned below.
-            "peft>=0.18,<0.19",
-            "transformers>=4.57.6,<5",
-            "fastapi>=0.115,<1",
-            "uvicorn[standard]>=0.34,<1",
-            *self.python_packages,
-        ]
-        if any(character in self.base_image for character in "\r\n"):
-            raise ValueError("base_image must not contain newlines")
-
-        # Custom Beam/Beta9 images skip source sync. Embed the server package so
-        # an installed OpenTinker wheel can launch a Pod without a remote checkout.
-        package_source = Path(__file__).parent
-        with tempfile.TemporaryDirectory(prefix="opentinker-image-") as temp_directory:
-            context = Path(temp_directory)
-            shutil.copytree(
-                package_source,
-                context / "opentinker",
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-            )
-            install = " ".join(shlex.quote(package) for package in packages)
-            dockerfile_lines = [
-                f"FROM {self.base_image}",
-                f"RUN python -m pip install --no-cache-dir {install}",
-                *(f"RUN /bin/bash -lc {shlex.quote(command)}" for command in self.commands),
-                "COPY opentinker /opt/opentinker/opentinker",
-                "ENV PYTHONPATH=/opt/opentinker",
-            ]
-            dockerfile = context / "Dockerfile"
-            dockerfile.write_text("\n".join(dockerfile_lines) + "\n")
-
-            # Beam hashes the archived build context. Temporary directories and
-            # the generated Dockerfile otherwise get a fresh timestamp on every
-            # invocation, defeating image reuse even when the inputs are equal.
-            for path in sorted(context.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-                os.utime(path, (_REPRODUCIBLE_MTIME, _REPRODUCIBLE_MTIME))
-            os.utime(context, (_REPRODUCIBLE_MTIME, _REPRODUCIBLE_MTIME))
-            return provider.Image.from_dockerfile(str(dockerfile), context_dir=str(context))
+        return build_backend_image(
+            provider,
+            BackendImageSpec(
+                base_image=self.base_image,
+                tinker_requirement=self.tinker_requirement,
+                python_packages=self.python_packages,
+                commands=self.commands,
+            ),
+        )
 
     def _load_provider(self) -> ModuleType:
-        try:
-            provider = importlib.import_module(self.provider)
-        except ModuleNotFoundError as exc:
-            if exc.name != self.provider:
-                raise
-            raise ImportError(
-                f"{self.provider} is required; install `opentinker[{self.provider}]`"
-            ) from exc
-        if self.profile is not None:
-            from beta9.abstractions.base import set_channel
-            from beta9.config import get_config_context
-
-            context = get_config_context(self.profile)
-            if context is None:
-                raise ValueError(f"unknown Beta9 profile: {self.profile}")
-            set_channel(context=context)
-            self._provider_context = context
-        missing = [name for name in ("Image", "Pod", "Volume") if not hasattr(provider, name)]
-        if missing:
-            raise ImportError(
-                f"installed {self.provider} package is incompatible (missing: {', '.join(missing)})"
-            )
-        return provider
-
-    def _machine_command(self, *arguments: str) -> list[str]:
-        executable = shutil.which(self.provider)
-        if executable is None:
-            raise RuntimeError(f"could not find the {self.provider!r} CLI")
-        command = [executable]
-        if self.profile is not None:
-            command.extend(["--context", self.profile])
-        command.extend(arguments)
-        return command
-
-    def _reserve_machine(self) -> None:
-        assert self.gpu is None or isinstance(self.gpu, str)
-        if self._reserved_pool is not None:
-            raise RuntimeError("this adapter already owns an on-demand machine")
-        requested_gpu = self.gpu
-        original_pool = self.pool
-        gpu_label = requested_gpu.lower() if requested_gpu is not None else "ondemand"
-        pool = self.pool or self.machine_name or f"opentinker-{gpu_label}-{uuid.uuid4().hex[:8]}"
-        arguments = [
-            "machine",
-            "reserve",
-            "--nodes",
-            "1",
-            "--ttl",
-            self.machine_ttl,
-            "--name",
-            pool,
-        ]
-        if requested_gpu is not None:
-            arguments.extend(["--gpu", requested_gpu])
-        command = self._machine_command(*arguments)
-        self.pool = pool
-        self._reserved_pool = pool
-        try:
-            # Inherit the terminal streams. Beam opens its native offer picker
-            # when interactive and selects the cheapest offer when headless.
-            result = subprocess.run(command, check=False)
-        except BaseException:
-            # The reservation RPC may have succeeded before the local wait was
-            # interrupted. Record ownership first so cleanup always attempts a release.
-            self._release_reserved_machine()
-            raise
-        if result.returncode != 0:
-            self._release_reserved_machine()
-            raise RuntimeError("failed to reserve an on-demand machine; see Beam's output above")
-
-        try:
-            selected_gpu, selected_gpu_count = self._pool_hardware(pool)
-        except BaseException:
-            self._release_reserved_machine()
-            raise
-        if selected_gpu is None:
-            # A declined interactive confirmation exits successfully without
-            # creating a pool. There is nothing to release in that case.
-            self._reserved_pool = None
-            self.pool = original_pool
-            raise RuntimeError("on-demand reservation was cancelled; no machine was created")
-        if requested_gpu is not None and selected_gpu != requested_gpu:
-            self._release_reserved_machine()
-            raise RuntimeError(
-                f"Beam reserved {selected_gpu}, but OpenTinker requested {requested_gpu}"
-            )
-        try:
-            self._validate_pool_gpu_count(pool, selected_gpu_count)
-        except BaseException:
-            self._release_reserved_machine()
-            raise
-        self.gpu = selected_gpu
-        logger.info(
-            "Reserved on-demand Beam pool %s with %sx %s",
-            pool,
-            selected_gpu_count,
-            selected_gpu,
-        )
-
-    def _pool_gpu(self, pool: str) -> str | None:
-        """Return the single GPU type advertised by a connected machine pool."""
-
-        return self._pool_hardware(pool)[0]
-
-    def _pool_hardware(self, pool: str) -> tuple[str | None, int]:
-        """Return a pool's GPU type and largest single-machine GPU count."""
-
-        command = self._machine_command(
-            "machine",
-            "list",
-            "--pool",
-            pool,
-            "--no-offers",
-            "--format",
-            "json",
-        )
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(f"could not inspect Beam/Beta9 pool {pool!r}: {detail}")
-        try:
-            payload = json.loads(result.stdout)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                "Beam/Beta9 returned invalid JSON while inspecting the pool"
-            ) from exc
-        machines = payload.get("machines")
-        if not isinstance(machines, list):
-            raise RuntimeError("Beam's machine list response did not contain a machine list")
-        matched_machines = [
-            machine
-            for machine in machines
-            if isinstance(machine, dict) and machine.get("pool_name") == pool
-        ]
-        if not matched_machines:
-            return None, 0
-        gpus = {
-            gpu.strip()
-            for machine in matched_machines
-            for gpu in str(machine.get("gpu") or "").split(",")
-            if gpu.strip()
-        }
-        if not gpus:
-            raise RuntimeError("OpenTinker requires a GPU, but the selected machine is CPU-only")
-        if len(gpus) != 1:
-            raise RuntimeError(
-                f"Beam/Beta9 pool {pool!r} contains multiple GPU types; pass gpu= explicitly"
-            )
-        gpu_counts = [
-            int(machine.get("gpu_count") or 1) for machine in matched_machines if machine.get("gpu")
-        ]
-        return gpus.pop(), max(gpu_counts, default=0)
-
-    def _validate_pool_gpu_count(self, pool: str, available: int) -> None:
-        requested = int(self.gpu_count or 1)
-        if available < requested:
-            raise RuntimeError(
-                f"pool {pool!r} has at most {available} GPU{'s' if available != 1 else ''} "
-                f"on one machine, but OpenTinker requested {requested}; a multi-GPU Pod "
-                "cannot span machines"
-            )
+        runtime = load_provider(self.provider, profile=self.profile)
+        self._provider_context = runtime.context
+        return runtime.module
 
     def _release_reserved_machine(self) -> bool:
-        pool = self._reserved_pool
-        if pool is None or not self.release_machine:
+        if self._hardware is None:
             return True
-        command = self._machine_command("machine", "release", "--pool", pool, "--yes")
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            logger.error("Failed to release on-demand Beam pool %s: %s", pool, detail)
-            return False
-        self._reserved_pool = None
-        logger.info("Released on-demand Beam pool %s", pool)
-        return True
+        clean = self._hardware.release()
+        self.gpu = self._hardware.gpu
+        self.pool = self._hardware.pool
+        self._reserved_pool = self._hardware.owned_pool
+        return clean
 
     def _patch_tinker_service_client(self) -> None:
         if self._original_service_client is not None:

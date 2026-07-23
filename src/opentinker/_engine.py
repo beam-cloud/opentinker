@@ -5,15 +5,13 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
-import os
-import shutil
-import tempfile
 import threading
 import uuid
 from pathlib import Path
 from typing import Any
+
+from ._checkpoint import CheckpointKind, CheckpointStore, safe_checkpoint_name
 
 
 class TransformersEngine:
@@ -34,8 +32,9 @@ class TransformersEngine:
     ) -> None:
         self.base_model = _model_name(base_model)
         self.max_length = max_length
-        self.checkpoint_root = Path(checkpoint_root)
-        self.checkpoint_root.mkdir(parents=True, exist_ok=True)
+        self.checkpoints = CheckpointStore(checkpoint_root, volume_name=volume_name)
+        # Retain these attributes for callers that inspect the engine directly.
+        self.checkpoint_root = self.checkpoints.root
         self.volume_name = volume_name
         self.trust_remote_code = trust_remote_code
         self.distributed_rank = distributed_rank
@@ -56,7 +55,6 @@ class TransformersEngine:
         self._models: dict[str, dict[str, Any]] = {}
         self._optimizers: dict[str, Any] = {}
         self._sampling_sessions: dict[str, dict[str, Any]] = {}
-        self._saved_checkpoints: dict[str, dict[str, Any]] = {}
         self._forward_calls = 0
         self._backward_calls = 0
         self._forward_datums = 0
@@ -521,17 +519,10 @@ class TransformersEngine:
             torch, _peft, _transformers, _peft_model = self._imports()
             model_id = str(request.get("model_id", ""))
             model = self._activate(model_id)
-            checkpoint_type = "sampler_weights" if for_sampler else "weights"
-            name = _safe_name(request.get("path") or f"step-{uuid.uuid4().hex[:12]}")
-            path = self.checkpoint_root / model_id / checkpoint_type / name
-            if path.exists() and not request.get("overwrite", False):
-                raise FileExistsError(f"checkpoint already exists: {name}")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # Serialize on the Pod's local disk first. Beam volume directory renames
-            # do not preserve nested PEFT adapter directories, and direct safetensor
-            # writes can be observed before their header has been fully flushed.
-            with tempfile.TemporaryDirectory(prefix="tinker-checkpoint-") as temp_dir:
-                temporary = Path(temp_dir)
+            checkpoint_type: CheckpointKind = "sampler_weights" if for_sampler else "weights"
+            name = safe_checkpoint_name(request.get("path") or f"step-{uuid.uuid4().hex[:12]}")
+
+            def write_checkpoint(temporary: Path) -> None:
                 model.save_pretrained(
                     temporary,
                     selected_adapters=[model_id],
@@ -558,50 +549,14 @@ class TransformersEngine:
                     )
                     + "\n"
                 )
-                manifest_files = [
-                    _file_record(item, relative_to=temporary)
-                    for item in sorted(temporary.rglob("*"))
-                    if item.is_file()
-                ]
-                manifest = {"format_version": 1, "files": manifest_files}
-                manifest_path = temporary / "opentinker-checksums.json"
-                manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-                expected_files = [
-                    *manifest_files,
-                    _file_record(manifest_path, relative_to=temporary),
-                ]
-                if path.exists():
-                    shutil.rmtree(path)
-                try:
-                    published = _publish_checkpoint(
-                        temporary,
-                        path,
-                        geesefs_version=_geesefs_version(self.checkpoint_root),
-                        expected_files=expected_files,
-                    )
-                except BaseException:
-                    if path.exists():
-                        shutil.rmtree(path)
-                    raise
-            volume_path = f"{self.volume_name}/checkpoints/{model_id}/{checkpoint_type}/{name}"
-            uri = f"tinker://{model_id}/{checkpoint_type}/{name}"
-            manifest_record = next(
-                item for item in published if item["path"] == "opentinker-checksums.json"
+
+            checkpoint = self.checkpoints.publish(
+                model_id=model_id,
+                kind=checkpoint_type,
+                name=name,
+                overwrite=bool(request.get("overwrite", False)),
+                write=write_checkpoint,
             )
-            self._saved_checkpoints[uri] = {
-                "volume_path": volume_path,
-                "manifest_sha256": manifest_record["sha256"],
-                "verified": True,
-                "verification": (
-                    "geesefs-fsync-sha256"
-                    if manifest_record["etag"] is not None
-                    else "local-fsync-sha256"
-                ),
-                "geesefs_version": manifest_record["geesefs_version"],
-                "file_count": len(published),
-                "total_bytes": sum(int(item["size"]) for item in published),
-                "files": published,
-            }
             # The official Tinker client validates model_path locally and only
             # accepts tinker:// handles. The files still live at the equivalent
             # beam://<volume>/checkpoints/... path for direct Volume access.
@@ -609,7 +564,7 @@ class TransformersEngine:
                 session_id = str(uuid.uuid4())
                 self._sampling_sessions[session_id] = {
                     "base_model": self.base_model,
-                    "model_path": uri,
+                    "model_path": checkpoint.uri,
                 }
                 return {
                     "type": "save_weights_for_sampler",
@@ -617,22 +572,14 @@ class TransformersEngine:
                 }
             return {
                 "type": "save_weights_for_sampler" if for_sampler else "save_weights",
-                "path": uri,
+                "path": checkpoint.uri,
             }
 
     def prepare_shutdown(self) -> dict[str, Any]:
         """Return in-Pod durability proofs for every completed checkpoint."""
 
         with self._lock:
-            checkpoints = [
-                {"uri": uri, **checkpoint}
-                for uri, checkpoint in sorted(self._saved_checkpoints.items())
-            ]
-            return {
-                "checkpoint_saved": bool(checkpoints),
-                "volume_paths": [str(checkpoint["volume_path"]) for checkpoint in checkpoints],
-                "checkpoints": checkpoints,
-            }
+            return self.checkpoints.shutdown_report()
 
     def close(self) -> None:
         """Release rank-local model memory during an orderly server shutdown."""
@@ -848,21 +795,7 @@ class TransformersEngine:
             return response
 
     def _uri_path(self, uri: str) -> Path:
-        beam_prefix = f"beam://{self.volume_name}/checkpoints/"
-        if uri.startswith(beam_prefix):
-            parts = uri.removeprefix(beam_prefix).split("/")
-        elif uri.startswith("tinker://"):
-            parts = uri.removeprefix("tinker://").split("/")
-        else:
-            raise ValueError(f"checkpoint path must start with {beam_prefix!r} or 'tinker://'")
-        if len(parts) != 3 or parts[1] not in {"weights", "sampler_weights"}:
-            raise ValueError(f"invalid checkpoint path: {uri}")
-        if any(part in {"", ".", ".."} for part in parts):
-            raise ValueError(f"invalid checkpoint path: {uri}")
-        path = self.checkpoint_root.joinpath(*parts)
-        if not path.exists():
-            raise FileNotFoundError(f"checkpoint does not exist: {uri}")
-        return path
+        return self.checkpoints.resolve(uri)
 
 
 def _model_name(value: str) -> str:
@@ -870,13 +803,6 @@ def _model_name(value: str) -> str:
         if value.startswith(prefix):
             return value.removeprefix(prefix)
     return value
-
-
-def _safe_name(value: Any) -> str:
-    name = str(value)
-    if not name or name in {".", ".."} or "/" in name or "\\" in name:
-        raise ValueError("checkpoint name must be a single non-empty path component")
-    return name
 
 
 def _input_tokens(model_input: dict[str, Any]) -> list[int]:
@@ -941,117 +867,6 @@ def _adapter_path(path: Path) -> Path:
     if len(configs) != 1:
         raise FileNotFoundError(f"could not locate one PEFT adapter under {path}")
     return configs[0].parent
-
-
-def _geesefs_version(path: Path) -> str | None:
-    """Return the mounted geesefs version, or ``None`` for ordinary local storage."""
-
-    try:
-        return os.getxattr(path, "geesefs").decode()
-    except OSError:
-        return None
-
-
-def _file_record(path: Path, *, relative_to: Path) -> dict[str, Any]:
-    return {
-        "path": path.relative_to(relative_to).as_posix(),
-        "size": path.stat().st_size,
-        "sha256": _sha256_file(path),
-    }
-
-
-def _publish_checkpoint(
-    source: Path,
-    destination: Path,
-    *,
-    geesefs_version: str | None,
-    expected_files: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Copy, hash, and synchronously persist a checkpoint on its mounted Volume.
-
-    Beam Volumes use geesefs staged writes. Setting the digest xattr before
-    ``fsync`` places it on the same object upload; ``fsync`` then blocks until
-    that upload completes. The ETag returned by object storage proves the
-    barrier reached the remote object without downloading it again.
-    """
-
-    expected_by_path = {str(item["path"]): item for item in expected_files}
-    if len(expected_by_path) != len(expected_files):
-        raise RuntimeError("checkpoint contains duplicate manifest paths")
-    destination.mkdir(parents=True)
-    records: list[dict[str, Any]] = []
-    for source_file in sorted(source.rglob("*")):
-        if not source_file.is_file():
-            continue
-        relative = source_file.relative_to(source)
-        destination_file = destination / relative
-        destination_file.parent.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256()
-        size = 0
-        with source_file.open("rb") as reader, destination_file.open("wb") as writer:
-            for chunk in iter(lambda: reader.read(1024 * 1024), b""):
-                writer.write(chunk)
-                digest.update(chunk)
-                size += len(chunk)
-            writer.flush()
-            checksum = digest.hexdigest()
-            if geesefs_version is not None:
-                os.setxattr(
-                    destination_file,
-                    "user.--content-sha256",
-                    checksum.encode(),
-                )
-            os.fsync(writer.fileno())
-
-        etag: str | None = None
-        if geesefs_version is not None:
-            stored_checksum = os.getxattr(
-                destination_file,
-                "user.--content-sha256",
-            ).decode()
-            if stored_checksum != checksum:
-                raise RuntimeError(f"geesefs checksum metadata mismatch for {relative.as_posix()}")
-            etag_names = [name for name in os.listxattr(destination_file) if name.endswith(".etag")]
-            if len(etag_names) != 1:
-                raise RuntimeError(
-                    f"geesefs did not return one remote ETag for {relative.as_posix()}"
-                )
-            etag = os.getxattr(destination_file, etag_names[0]).decode()
-            if not etag:
-                raise RuntimeError(
-                    f"geesefs returned an empty remote ETag for {relative.as_posix()}"
-                )
-
-        expected = expected_by_path.pop(relative.as_posix(), None)
-        if expected is None:
-            raise RuntimeError(f"checkpoint manifest omitted {relative.as_posix()}")
-        if size != expected["size"] or checksum != expected["sha256"]:
-            raise RuntimeError(f"checkpoint copy changed {relative.as_posix()}")
-        records.append(
-            {
-                **expected,
-                "etag": etag,
-                "geesefs_version": geesefs_version,
-            }
-        )
-
-    if expected_by_path:
-        missing = ", ".join(sorted(expected_by_path))
-        raise RuntimeError(f"checkpoint manifest referenced missing files: {missing}")
-    directory_fd = os.open(destination, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-    return records
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _truncate_stop(

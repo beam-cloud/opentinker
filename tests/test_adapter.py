@@ -10,7 +10,9 @@ import httpx
 import pytest
 import tinker
 
+from opentinker import _image as image_module
 from opentinker import adapter as beam_module
+from opentinker._hardware import HardwareManager
 from opentinker.adapter import BeamComputeAdapter
 
 
@@ -138,7 +140,7 @@ def test_starts_backend_and_returns_normal_client(
         secrets=("HF_TOKEN",),
         env={"HF_HUB_ENABLE_HF_TRANSFER": "1"},
     )
-    monkeypatch.setattr(adapter, "_pool_hardware", lambda _pool: ("H100", 8))
+    monkeypatch.setattr(HardwareManager, "inspect_pool", lambda _self, _pool: ("H100", 8))
     client = adapter.start(wait=False)
 
     monitoring = capsys.readouterr().err
@@ -375,16 +377,20 @@ def test_builds_owned_backend_image(monkeypatch: pytest.MonkeyPatch) -> None:
         "Dockerfile",
         "opentinker/__init__.py",
         "opentinker/_api.py",
+        "opentinker/_checkpoint.py",
         "opentinker/_distillation.py",
         "opentinker/_distributed.py",
         "opentinker/_engine.py",
         "opentinker/_examples.py",
+        "opentinker/_hardware.py",
+        "opentinker/_image.py",
+        "opentinker/_provider.py",
         "opentinker/_server.py",
         "opentinker/adapter.py",
         "opentinker/data.py",
         "opentinker/py.typed",
     ]
-    assert image.kwargs["context_mtimes"] == {beam_module._REPRODUCIBLE_MTIME}
+    assert image.kwargs["context_mtimes"] == {image_module._REPRODUCIBLE_MTIME}
 
 
 def test_default_image_uses_running_tinker_version(monkeypatch: pytest.MonkeyPatch) -> None:

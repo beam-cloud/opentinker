@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from opentinker import _engine as engine_module
+from opentinker import _checkpoint as checkpoint_module
 from opentinker._engine import TransformersEngine
 
 
@@ -117,7 +117,7 @@ def test_checkpoint_is_staged_locally_before_volume_copy(
 
     monkeypatch.setattr(engine, "_imports", lambda: (None, None, None, None))
     monkeypatch.setattr(engine, "_activate", lambda _model_id: FakeModel())
-    monkeypatch.setattr(engine_module, "_geesefs_version", lambda _path: "0.42-test")
+    monkeypatch.setattr(checkpoint_module, "_geesefs_version", lambda _path: "0.42-test")
     checkpoint_xattrs: dict[str, dict[str, bytes]] = {}
 
     def setxattr(path: Path, name: str, value: bytes) -> None:
@@ -128,10 +128,10 @@ def test_checkpoint_is_staged_locally_before_volume_copy(
             return b'"remote-etag"'
         return checkpoint_xattrs[str(path)][name]
 
-    monkeypatch.setattr(engine_module.os, "setxattr", setxattr, raising=False)
-    monkeypatch.setattr(engine_module.os, "getxattr", getxattr, raising=False)
+    monkeypatch.setattr(checkpoint_module.os, "setxattr", setxattr, raising=False)
+    monkeypatch.setattr(checkpoint_module.os, "getxattr", getxattr, raising=False)
     monkeypatch.setattr(
-        engine_module.os,
+        checkpoint_module.os,
         "listxattr",
         lambda _path: ["user.--content-sha256", "s3.etag"],
         raising=False,
