@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+import contextlib
 import json
-import time
+import tarfile
 from importlib.metadata import version
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 import tinker
 
 from opentinker import adapter as beam_module
-from opentinker._server import FutureStore, TransformersEngine, create_app
 from opentinker.adapter import BeamComputeAdapter
 
 
@@ -52,11 +52,13 @@ class FakePodInstance:
         self,
         *,
         url: str = "https://pod.example.test",
+        management_url: str = "https://dashboard.example.test/pods/pod-123",
         ok: bool = True,
         error_msg: str = "",
     ) -> None:
         self.container_id = "pod-123"
         self.url = url
+        self.management_url = management_url
         self.ok = ok
         self.error_msg = error_msg
         self.terminate_calls = 0
@@ -116,10 +118,14 @@ def patch_adapter_dependencies(
 
     monkeypatch.setattr(beam_module, "ServiceClient", service_client)
     monkeypatch.setattr(BeamComputeAdapter, "_load_provider", lambda _self: provider)
+    monkeypatch.setattr(BeamComputeAdapter, "_get_checkpoint_export_plan", lambda *_args: [])
     return clients
 
 
-def test_starts_backend_and_returns_normal_client(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_starts_backend_and_returns_normal_client(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     provider, pod_calls, instance = fake_provider()
     clients = patch_adapter_dependencies(monkeypatch, provider)
 
@@ -133,6 +139,14 @@ def test_starts_backend_and_returns_normal_client(monkeypatch: pytest.MonkeyPatc
         env={"HF_HUB_ENABLE_HF_TRANSFER": "1"},
     )
     client = adapter.start(wait=False)
+
+    monitoring = capsys.readouterr().err
+    assert "OpenTinker Pod created: pod-123" in monitoring
+    assert "dashboard: https://dashboard.example.test/pods/pod-123" in monitoring
+    assert "beam container attach pod-123" in monitoring
+    assert "app:       tinker-training" in monitoring
+    assert adapter.container_id == "pod-123"
+    assert adapter.dashboard_url == "https://dashboard.example.test/pods/pod-123"
 
     assert client is clients[0]
     assert clients[0].kwargs == {
@@ -150,8 +164,9 @@ def test_starts_backend_and_returns_normal_client(monkeypatch: pytest.MonkeyPatc
     assert options["secrets"] == ["HF_TOKEN"]
     assert options["env"] == {
         "OPENTINKER_BASE_MODEL": "Qwen/Qwen3-8B",
-        "OPENTINKER_CHECKPOINT_ROOT": "/tinker-data/checkpoints",
+        "OPENTINKER_CHECKPOINT_ROOT": "/volumes/tinker-data/checkpoints",
         "OPENTINKER_VOLUME_NAME": "tinker-checkpoints",
+        "OPENTINKER_VOLUME_SYNC_SECONDS": "60",
         "OPENTINKER_MAX_LENGTH": "8192",
         "OPENTINKER_PORT": "8000",
         "OPENTINKER_SAMPLING_GPU": "1",
@@ -164,8 +179,208 @@ def test_starts_backend_and_returns_normal_client(monkeypatch: pytest.MonkeyPatc
     assert adapter.stop() is True
     assert clients[0].holder.close_calls == 1
     assert instance.terminate_calls == 1
+    assert adapter.container_id == "pod-123"
+    assert adapter.dashboard_url == "https://dashboard.example.test/pods/pod-123"
     assert adapter.stop() is True
     assert instance.terminate_calls == 1
+
+
+def test_monitoring_handoff_precedes_readiness_and_interrupt_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    provider, _, instance = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-0.6B", profile="prod3")
+
+    def interrupt(_token: str | None) -> None:
+        assert "dashboard: https://dashboard.example.test/pods/pod-123" in capsys.readouterr().err
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(adapter, "_wait_until_ready", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        adapter.start()
+
+    output = capsys.readouterr().err
+    assert "OpenTinker training interrupted; cleaning up Pod pod-123." in output
+    assert "dashboard: https://dashboard.example.test/pods/pod-123" in output
+    assert "partially started Pod will be terminated" in output
+    assert instance.terminate_calls == 1
+
+
+def test_beam_dashboard_falls_back_to_live_container_page(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    provider, _, _ = fake_provider(FakePodInstance(management_url=""))
+    patch_adapter_dependencies(monkeypatch, provider)
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-0.6B", profile="prod3")
+
+    adapter.start(wait=False)
+
+    output = capsys.readouterr().err
+    assert "dashboard: https://platform.beam.cloud/containers" in output
+    assert "beam --context prod3 container attach pod-123" in output
+    assert adapter.dashboard_url == "https://platform.beam.cloud/containers"
+    assert adapter.stop() is True
+
+
+def test_self_hosted_beta9_without_management_url_prints_cli_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    provider, _, _ = fake_provider(FakePodInstance(management_url=""))
+    patch_adapter_dependencies(monkeypatch, provider)
+    adapter = BeamComputeAdapter(
+        base_model="Qwen/Qwen3-0.6B",
+        provider="beta9",
+        profile="private-cluster",
+    )
+
+    adapter.start(wait=False)
+
+    output = capsys.readouterr().err
+    assert "provider did not return a direct link" in output
+    assert "beta9 --context private-cluster container list" in output
+    assert adapter.dashboard_url is None
+    assert adapter.stop() is True
+
+
+def test_context_interrupt_prints_dashboard_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    provider, _, instance = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(BeamComputeAdapter, "_wait_until_ready", lambda *_args: None)
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-0.6B")
+
+    with pytest.raises(KeyboardInterrupt), adapter:
+        _ = capsys.readouterr()
+        raise KeyboardInterrupt
+
+    output = capsys.readouterr().err
+    assert "OpenTinker training interrupted; cleaning up Pod pod-123." in output
+    assert "dashboard: https://dashboard.example.test/pods/pod-123" in output
+    assert "Completed checkpoints will be flushed" in output
+    assert instance.terminate_calls == 1
+
+
+def test_stop_gets_live_checkpoint_export_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-0.6B")
+    adapter._resolved_token = "provider-token"
+
+    def post(url: str, *, headers: dict[str, str], timeout: int) -> httpx.Response:
+        assert url == "https://pod.example.test/opentinker/prepare-shutdown"
+        assert headers == {"Authorization": "Bearer provider-token"}
+        assert timeout == 10
+        return httpx.Response(
+            200,
+            json={
+                "checkpoint_saved": True,
+                "wait_seconds": 12.5,
+                "volume_paths": ["tinker-checkpoints/checkpoints/model/weights/final"],
+                "checkpoints": [
+                    {
+                        "uri": "tinker://model/weights/final",
+                        "volume_path": "tinker-checkpoints/checkpoints/model/weights/final",
+                    }
+                ],
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(beam_module.httpx, "post", post)
+
+    checkpoints = adapter._get_checkpoint_export_plan(FakePodInstance())
+
+    assert checkpoints == [
+        {
+            "uri": "tinker://model/weights/final",
+            "volume_path": "tinker-checkpoints/checkpoints/model/weights/final",
+        }
+    ]
+
+
+def test_persists_live_checkpoint_through_beam_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = tmp_path / "payload" / "checkpoint"
+    (payload / "model-1").mkdir(parents=True)
+    (payload / "opentinker.json").write_text("{}")
+    (payload / "model-1" / "adapter_model.bin").write_bytes(b"trained-weights")
+    archive = tmp_path / "checkpoint.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        handle.add(payload, arcname="checkpoint")
+    archive_bytes = archive.read_bytes()
+
+    def stream(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, str],
+        timeout: httpx.Timeout,
+    ) -> Any:
+        assert method == "POST"
+        assert url == "https://pod.example.test/opentinker/export-checkpoint"
+        assert headers == {"Authorization": "Bearer provider-token"}
+        assert json == {"path": "tinker://model-1/weights/final"}
+        assert timeout.connect == 10
+        return contextlib.closing(
+            httpx.Response(
+                200,
+                content=archive_bytes,
+                request=httpx.Request(method, url),
+            )
+        )
+
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        commands.append(command)
+        source = Path(command[-2])
+        assert source.name == "checkpoint"
+        assert (source / "opentinker.json").read_text() == "{}"
+        assert (source / "model-1" / "adapter_model.bin").read_bytes() == b"trained-weights"
+        assert kwargs["check"] is False
+        assert kwargs["text"] is True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-0.6B", profile="prod3")
+    adapter._resolved_token = "provider-token"
+    monkeypatch.setattr(beam_module.httpx, "stream", stream)
+    monkeypatch.setattr(beam_module.shutil, "which", lambda _name: "/usr/local/bin/beam")
+    monkeypatch.setattr(beam_module.subprocess, "run", run)
+    monkeypatch.setattr(
+        adapter,
+        "_wait_for_published_volume_paths",
+        lambda paths: list(paths) == ["tinker-checkpoints/checkpoints/model-1/weights/final"],
+    )
+
+    persisted = adapter._persist_volume_checkpoints(
+        FakePodInstance(),
+        [
+            {
+                "uri": "tinker://model-1/weights/final",
+                "volume_path": "tinker-checkpoints/checkpoints/model-1/weights/final",
+            }
+        ],
+    )
+
+    assert persisted is True
+    assert commands == [
+        [
+            "/usr/local/bin/beam",
+            "--context",
+            "prod3",
+            "cp",
+            commands[0][-2],
+            "beam://tinker-checkpoints/checkpoints/model-1/weights/final",
+        ]
+    ]
 
 
 def test_context_scopes_cookbook_created_service_clients(
@@ -227,8 +442,12 @@ def test_builds_owned_backend_image(monkeypatch: pytest.MonkeyPatch) -> None:
     assert image.kwargs["context_files"] == [
         "Dockerfile",
         "opentinker/__init__.py",
+        "opentinker/_api.py",
+        "opentinker/_engine.py",
+        "opentinker/_examples.py",
         "opentinker/_server.py",
         "opentinker/adapter.py",
+        "opentinker/data.py",
         "opentinker/py.typed",
     ]
     assert image.kwargs["context_mtimes"] == {beam_module._REPRODUCIBLE_MTIME}
@@ -277,6 +496,59 @@ def test_wait_failure_terminates_pod(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(TimeoutError, match="still loading"):
         BeamComputeAdapter(base_model="Qwen/Qwen3-8B").start()
     assert instance.terminate_calls == 1
+
+
+def test_failed_start_skips_checkpoint_export(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, _, instance = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    export_calls = 0
+
+    def export_plan(*_args: Any) -> list[dict[str, str]]:
+        nonlocal export_calls
+        export_calls += 1
+        return []
+
+    monkeypatch.setattr(BeamComputeAdapter, "_get_checkpoint_export_plan", export_plan)
+    monkeypatch.setattr(
+        BeamComputeAdapter,
+        "_wait_until_ready",
+        lambda *_: (_ for _ in ()).throw(TimeoutError("still loading")),
+    )
+
+    with pytest.raises(TimeoutError, match="still loading"):
+        BeamComputeAdapter(base_model="Qwen/Qwen3-8B").start()
+
+    assert export_calls == 0
+    assert instance.terminate_calls == 1
+
+
+def test_cleanup_attempts_every_resource_after_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = BeamComputeAdapter(base_model="Qwen/Qwen3-8B")
+    instance = FakePodInstance()
+    adapter._client = cast(Any, FakeServiceClient())
+    adapter._instance = instance
+    released = False
+
+    def release() -> bool:
+        nonlocal released
+        released = True
+        return True
+
+    monkeypatch.setattr(
+        adapter,
+        "_close_client",
+        lambda _client: (_ for _ in ()).throw(RuntimeError("close failed")),
+    )
+    monkeypatch.setattr(adapter, "_get_checkpoint_export_plan", lambda _instance: [])
+    monkeypatch.setattr(adapter, "_release_reserved_machine", release)
+
+    assert adapter.stop() is False
+    assert adapter._client is None
+    assert adapter._instance is None
+    assert instance.terminate_calls == 1
+    assert released is True
 
 
 def test_authorized_backend_requires_access_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -369,6 +641,77 @@ def test_on_demand_machine_is_reserved_and_released(monkeypatch: pytest.MonkeyPa
         "opentinker-test",
         "--yes",
     ]
+
+
+def test_existing_pool_discovers_its_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, pod_calls, instance = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        commands.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"machines": [{"pool_name": "my-hardware", "gpu": "RTX4090"}]}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(beam_module.shutil, "which", lambda _name: "/usr/local/bin/beam")
+    monkeypatch.setattr(beam_module.subprocess, "run", run)
+
+    adapter = BeamComputeAdapter(
+        base_model="Qwen/Qwen3-0.6B",
+        profile="prod3",
+        pool="my-hardware",
+    )
+    assert adapter.gpu is None
+
+    adapter.start(wait=False)
+
+    assert commands == [
+        [
+            "/usr/local/bin/beam",
+            "--context",
+            "prod3",
+            "machine",
+            "list",
+            "--pool",
+            "my-hardware",
+            "--no-offers",
+            "--format",
+            "json",
+        ]
+    ]
+    assert adapter.gpu == "RTX4090"
+    assert pod_calls[0]["gpu"] == "RTX4090"
+    assert pod_calls[0]["pool"] == "my-hardware"
+    assert adapter.stop() is True
+    assert instance.terminate_calls == 1
+
+
+def test_existing_pool_without_connected_hardware_fails_clearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, pod_calls, _ = fake_provider()
+    patch_adapter_dependencies(monkeypatch, provider)
+    monkeypatch.setattr(beam_module.shutil, "which", lambda _name: "/usr/local/bin/beam")
+    monkeypatch.setattr(
+        beam_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"machines": []}),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="has no connected machines"):
+        BeamComputeAdapter(
+            base_model="Qwen/Qwen3-0.6B",
+            pool="empty-pool",
+        ).start(wait=False)
+
+    assert pod_calls == []
 
 
 def test_on_demand_machine_releases_when_pod_creation_fails(
@@ -552,249 +895,16 @@ def test_cancelling_on_demand_picker_does_not_create_or_release_pool(
         ({"gpu": ""}, "gpu"),
         ({"max_length": 0}, "max_length"),
         ({"volume_mount_path": "relative"}, "absolute"),
+        ({"volume_sync_seconds": -1}, "volume_sync_seconds"),
         ({"port": 0}, "port"),
         ({"wait_timeout": 0}, "wait_timeout"),
         ({"poll_interval": 0}, "poll_interval"),
         ({"env": {"TOKEN": 1}}, "env"),
         ({"tinker_requirement": ""}, "tinker_requirement"),
+        ({"on_demand": True, "pool": "existing"}, "mutually exclusive"),
     ],
 )
 def test_validates_configuration(kwargs: dict[str, Any], message: str) -> None:
     kwargs.setdefault("base_model", "Qwen/Qwen3-8B")
     with pytest.raises((TypeError, ValueError), match=message):
         BeamComputeAdapter(**kwargs)
-
-
-class ContractEngine:
-    base_model = "Qwen/Qwen3-0.6B"
-    max_length = 4096
-
-    def create_model(self, request: dict[str, Any]) -> dict[str, Any]:
-        return {"type": "create_model", "model_id": request["_model_id"]}
-
-    def get_info(self, request: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "model_id": request["model_id"],
-            "is_lora": True,
-            "lora_rank": 8,
-            "model_data": {"model_name": self.base_model, "tokenizer_id": self.base_model},
-        }
-
-    def weights_info(self, request: dict[str, Any]) -> dict[str, Any]:
-        assert request["tinker_path"]
-        return {
-            "base_model": self.base_model,
-            "is_lora": True,
-            "lora_rank": 8,
-            "train_mlp": True,
-            "train_attn": True,
-            "train_unembed": True,
-        }
-
-    def forward_backward(self, request: dict[str, Any], *, backward: bool) -> dict[str, Any]:
-        key = "forward_backward_input" if backward else "forward_input"
-        assert request[key]["loss_fn"] == "cross_entropy"
-        return {
-            "loss_fn_output_type": "CrossEntropyLossReturn",
-            "loss_fn_outputs": [{"logprobs": {"data": [-1.0], "dtype": "float32", "shape": [1]}}],
-            "metrics": {"loss:mean": 1.0},
-        }
-
-    def optim_step(self, request: dict[str, Any]) -> dict[str, Any]:
-        return {"metrics": {"learning_rate": request["adam_params"]["learning_rate"]}}
-
-    def save_weights(self, request: dict[str, Any], *, for_sampler: bool) -> dict[str, Any]:
-        kind = "sampler_weights" if for_sampler else "weights"
-        return {"path": f"tinker://{request['model_id']}/{kind}/test"}
-
-    def load_weights(self, request: dict[str, Any]) -> dict[str, Any]:
-        return {"type": "load_weights", "path": request["path"]}
-
-    def unload_model(self, request: dict[str, Any]) -> dict[str, Any]:
-        return {"type": "unload_model", "model_id": request["model_id"]}
-
-    def create_sampling_session(self, request: dict[str, Any]) -> dict[str, Any]:
-        return {"type": "create_sampling_session", "sampling_session_id": "sampler-1"}
-
-    def sample(self, request: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "type": "sample",
-            "sequences": [{"stop_reason": "length", "tokens": [42], "logprobs": [-0.1]}],
-            "prompt_cache_hit_tokens": 0,
-        }
-
-
-async def retrieve(client: httpx.AsyncClient, future: dict[str, Any]) -> dict[str, Any]:
-    for _ in range(100):
-        response = (
-            await client.post(
-                "/api/v1/retrieve_future",
-                json={"request_id": future["request_id"]},
-            )
-        ).json()
-        if response.get("type") != "try_again":
-            return response
-        time.sleep(0.001)
-    raise AssertionError("future did not resolve")
-
-
-async def test_owned_server_implements_tinker_contract() -> None:
-    transport = httpx.ASGITransport(app=create_app(ContractEngine()))
-    client = httpx.AsyncClient(transport=transport, base_url="http://test")
-
-    assert (await client.get("/api/v1/healthz")).json() == {"status": "ok"}
-    capabilities = (await client.get("/api/v1/get_server_capabilities")).json()
-    assert capabilities["supported_models"][0]["model_name"] == "Qwen/Qwen3-0.6B"
-    config = (await client.post("/api/v1/client/config", json={"sdk_version": "test"})).json()
-    assert config["proto_write_fwdbwd"] is False
-    weights_info = (
-        await client.post(
-            "/api/v1/weights_info",
-            json={"tinker_path": "beam://tinker-checkpoints/checkpoints/model/weights/final"},
-        )
-    ).json()
-    assert weights_info["base_model"] == "Qwen/Qwen3-0.6B"
-    assert weights_info["lora_rank"] == 8
-    session = (await client.post("/api/v1/create_session", json={})).json()
-    assert session["type"] == "create_session"
-    telemetry = (await client.post("/api/v1/telemetry", json={"events": []})).json()
-    assert telemetry == {"status": "accepted"}
-
-    create_future = (
-        await client.post(
-            "/api/v1/create_model",
-            json={"base_model": "Qwen/Qwen3-0.6B", "lora_config": {"rank": 8}},
-        )
-    ).json()
-    created = await retrieve(client, create_future)
-    model_id = created["model_id"]
-    assert create_future["model_id"] == model_id
-
-    request = {
-        "model_id": model_id,
-        "forward_backward_input": {
-            "loss_fn": "cross_entropy",
-            "data": [
-                {
-                    "model_input": {"chunks": [{"tokens": [1]}]},
-                    "loss_fn_inputs": {
-                        "target_tokens": {"data": [2], "dtype": "int64", "shape": [1]},
-                        "weights": {"data": [1.0], "dtype": "float32", "shape": [1]},
-                    },
-                }
-            ],
-        },
-    }
-    output = await retrieve(
-        client, (await client.post("/api/v1/forward_backward", json=request)).json()
-    )
-    assert output["metrics"] == {"loss:mean": 1.0}
-    optim = await retrieve(
-        client,
-        (
-            await client.post(
-                "/api/v1/optim_step",
-                json={"model_id": model_id, "adam_params": {"learning_rate": 0.001}},
-            )
-        ).json(),
-    )
-    assert optim["metrics"] == {"learning_rate": 0.001}
-    saved = await retrieve(
-        client,
-        (await client.post("/api/v1/save_weights", json={"model_id": model_id})).json(),
-    )
-    assert saved["path"].startswith("tinker://")
-    sampling_session = (
-        await client.post(
-            "/api/v1/create_sampling_session",
-            json={"session_id": session["session_id"], "base_model": "Qwen/Qwen3-0.6B"},
-        )
-    ).json()
-    sample = await retrieve(
-        client,
-        (
-            await client.post(
-                "/api/v1/asample",
-                json={
-                    "sampling_session_id": sampling_session["sampling_session_id"],
-                    "prompt": {"chunks": [{"tokens": [1]}]},
-                    "sampling_params": {"max_tokens": 1},
-                },
-            )
-        ).json(),
-    )
-    assert sample["sequences"][0]["tokens"] == [42]
-    await client.aclose()
-
-
-async def test_pending_future_uses_quiet_http_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    def pending(
-        _self: FutureStore,
-        request_id: str,
-        *,
-        wait_timeout: float = 30,
-    ) -> dict[str, Any]:
-        assert request_id == "still-running"
-        assert wait_timeout == 30
-        return {
-            "type": "try_again",
-            "request_id": request_id,
-            "queue_state": "active",
-        }
-
-    monkeypatch.setattr(FutureStore, "retrieve", pending)
-    transport = httpx.ASGITransport(app=create_app(ContractEngine()))
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            "/api/v1/retrieve_future",
-            json={"request_id": "still-running"},
-        )
-
-    assert response.status_code == 408
-    assert response.json()["type"] == "try_again"
-
-
-def test_checkpoint_is_staged_locally_before_volume_copy(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    model_id = "model-1"
-    engine = TransformersEngine(
-        base_model="Qwen/Qwen3-0.6B",
-        checkpoint_root=str(tmp_path),
-        sampling_gpu=False,
-    )
-
-    class FakeModel:
-        def save_pretrained(
-            self,
-            path: Path,
-            *,
-            selected_adapters: list[str],
-            safe_serialization: bool,
-        ) -> None:
-            assert selected_adapters == [model_id]
-            assert safe_serialization is False
-            assert not str(path).startswith(str(tmp_path))
-            adapter_path = path / model_id
-            adapter_path.mkdir(parents=True)
-            (adapter_path / "adapter_config.json").write_text("{}")
-            (adapter_path / "adapter_model.bin").write_bytes(b"weights")
-
-    monkeypatch.setattr(engine, "_imports", lambda: (None, None, None, None))
-    monkeypatch.setattr(engine, "_activate", lambda _model_id: FakeModel())
-    engine._models[model_id] = {
-        "rank": 8,
-        "train_mlp": True,
-        "train_attn": True,
-        "train_unembed": True,
-    }
-
-    response = engine.save_weights({"model_id": model_id, "path": "step-1"}, for_sampler=True)
-
-    checkpoint = tmp_path / model_id / "sampler_weights" / "step-1" / model_id
-    assert response["path"] == (
-        "beam://tinker-checkpoints/checkpoints/model-1/sampler_weights/step-1"
-    )
-    assert (checkpoint / "adapter_config.json").read_text() == "{}"
-    assert (checkpoint / "adapter_model.bin").read_bytes() == b"weights"

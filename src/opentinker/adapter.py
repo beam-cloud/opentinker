@@ -12,6 +12,8 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -31,7 +33,8 @@ _DEFAULT_PORT = 8000
 _DEFAULT_VOLUME_MOUNT = "/tinker-data"
 _DEFAULT_BASE_IMAGE = "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime"
 _CLIENT_API_KEY = "tml-beam-compute"
-_REPRODUCIBLE_MTIME = 315532800  # 1980-01-01; valid for ZIP-based build contexts.
+_BEAM_CONTAINERS_DASHBOARD = "https://platform.beam.cloud/containers"
+_REPRODUCIBLE_MTIME = 315619200  # 1980-01-02 UTC; ZIP-safe in western timezones.
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,7 @@ logger = logging.getLogger(__name__)
 class _PodInstance(Protocol):
     container_id: str
     url: str
+    management_url: str
     ok: bool
     error_msg: str
 
@@ -67,9 +71,10 @@ class BeamComputeAdapter:
     any ``ServiceClient()`` created inside the context to the same backend, so
     existing Tinker Cookbook entrypoints can run without recipe changes.
 
-    With no GPU configuration, serverless mode defaults to A10G and on-demand
-    mode opens Beam's hardware picker. A concrete on-demand ``gpu`` filters
-    that picker to one GPU family.
+    With no hardware configuration, serverless mode defaults to A10G.
+    On-demand mode opens Beam's hardware picker, while an existing ``pool``
+    discovers its GPU type automatically. A concrete ``gpu`` remains useful
+    for filtering offers or validating a heterogeneous environment.
 
     The first implementation is intentionally single-node. One GPU trains a
     PEFT LoRA adapter; sampling can share it or use a second GPU.
@@ -96,9 +101,11 @@ class BeamComputeAdapter:
     machine_ttl: str = "1h"
     machine_name: str | None = None
     release_machine: bool = True
+    show_dashboard_link: bool = True
 
     volume_name: str = "tinker-checkpoints"
     volume_mount_path: str = _DEFAULT_VOLUME_MOUNT
+    volume_sync_seconds: float = 60
     volume: Any | None = field(default=None, repr=False)
     volumes: Sequence[Any] = ()
     secrets: Sequence[str] = ()
@@ -121,6 +128,8 @@ class BeamComputeAdapter:
     _provider_context: Any | None = field(default=None, init=False, repr=False)
     _resolved_token: str | None = field(default=None, init=False, repr=False)
     _reserved_pool: str | None = field(default=None, init=False, repr=False)
+    _last_container_id: str | None = field(default=None, init=False, repr=False)
+    _last_dashboard_url: str | None = field(default=None, init=False, repr=False)
     _original_service_client: Any | None = field(default=None, init=False, repr=False)
     _service_client_proxy: Any | None = field(default=None, init=False, repr=False)
 
@@ -132,7 +141,7 @@ class BeamComputeAdapter:
         if self.profile is not None and not self.profile.strip():
             raise ValueError("profile must be non-empty or None")
         if self.gpu is None:
-            if not self.on_demand:
+            if not self.on_demand and self.pool is None:
                 self.gpu = "A10G"
         elif isinstance(self.gpu, str):
             if not self.gpu.strip():
@@ -155,6 +164,8 @@ class BeamComputeAdapter:
             raise ValueError("name must be non-empty or None")
         if self.pool is not None and not self.pool.strip():
             raise ValueError("pool must be non-empty or None")
+        if self.on_demand and self.pool is not None:
+            raise ValueError("on_demand and pool are mutually exclusive hardware modes")
         if not self.machine_ttl.strip():
             raise ValueError("machine_ttl must be non-empty")
         if self.machine_name is not None and not self.machine_name.strip():
@@ -167,6 +178,10 @@ class BeamComputeAdapter:
             raise ValueError("volume_name must be a non-empty string")
         if not self.volume_mount_path.startswith("/"):
             raise ValueError("volume_mount_path must be an absolute path")
+        if not self.volume_mount_path.strip("/"):
+            raise ValueError("volume_mount_path must name a directory below root")
+        if not 0 <= self.volume_sync_seconds <= 600:
+            raise ValueError("volume_sync_seconds must be between zero and 600")
         if not 1 <= self.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
         if self.keep_warm_seconds != -1 and self.keep_warm_seconds <= 0:
@@ -198,119 +213,370 @@ class BeamComputeAdapter:
 
         return _normalize_url(self._instance.url) if self._instance is not None else None
 
+    @property
+    def container_id(self) -> str | None:
+        """The current or most recently created Beam/Beta9 container ID."""
+
+        if self._instance is not None and self._instance.container_id:
+            return self._instance.container_id
+        return self._last_container_id
+
+    @property
+    def dashboard_url(self) -> str | None:
+        """The current or most recent Pod's provider dashboard URL."""
+
+        if self._instance is not None:
+            value = getattr(self._instance, "management_url", "").strip()
+            if value:
+                return value
+        if self._last_dashboard_url is not None:
+            return self._last_dashboard_url
+        if self.provider == "beam" and self.container_id is not None:
+            return _BEAM_CONTAINERS_DASHBOARD
+        return None
+
     def start(self, *, wait: bool = True) -> ServiceClient:
         """Start the backend and return an ordinary Tinker ``ServiceClient``."""
 
         if self._instance is not None:
             raise RuntimeError("this adapter already has a running backend")
         provider = self._load_provider()
-        image = self.image if self.image is not None else self._build_image(provider)
-        if self.on_demand:
-            # Image builds run on Beam's builder, not the reserved training node.
-            # Build first so the paid machine is only held for Pod startup/training.
-            if not getattr(image, "override_python_version", False):
-                image.ignore_python = True
-            build_result = image.build()
-            if not build_result.success:
-                raise RuntimeError("failed to build Beam/Beta9 image")
-            self._reserve_machine()
-        if self.gpu is None:
-            raise RuntimeError("no GPU was selected for the Beam/Beta9 Pod")
-        primary_volume = self.volume
-        if primary_volume is None:
-            try:
+        try:
+            image = self.image if self.image is not None else self._build_image(provider)
+            if self.on_demand:
+                # Build before reserving so paid hardware is held only for the workload.
+                if not getattr(image, "override_python_version", False):
+                    image.ignore_python = True
+                build_result = image.build()
+                if not build_result.success:
+                    raise RuntimeError("failed to build Beam/Beta9 image")
+                self._reserve_machine()
+            elif self.pool is not None and self.gpu is None:
+                self.gpu = self._pool_gpu(self.pool)
+                if self.gpu is None:
+                    raise RuntimeError(
+                        f"pool {self.pool!r} has no connected machines; attach hardware with "
+                        f"`{self.provider} pool join {self.pool}` or choose another pool"
+                    )
+            if self.gpu is None:
+                raise RuntimeError("no GPU was selected for the Beam/Beta9 Pod")
+            primary_volume = self.volume
+            if primary_volume is None:
                 primary_volume = provider.Volume(
                     name=self.volume_name,
                     mount_path=self.volume_mount_path,
                 )
-            except BaseException:
-                self._release_reserved_machine()
-                raise
-        pod_options: dict[str, Any] = {
+            pod_options = self._pod_options(image, primary_volume)
+            pod = provider.Pod(**pod_options)
+            instance = cast(_PodInstance, pod.create())
+            self._instance = instance
+            if not instance.ok:
+                raise RuntimeError(f"failed to create Beam/Beta9 Pod: {instance.error_msg}")
+            self._remember_instance(instance)
+            self._announce_pod()
+            if not instance.url:
+                raise RuntimeError("Beam/Beta9 created the Pod but returned no endpoint URL")
+            token = self._resolve_access_token(pod)
+            if self.authorized and not token:
+                raise RuntimeError(
+                    "authorized=True requires a Beam/Beta9 token; configure the selected profile "
+                    "or pass access_token"
+                )
+            self._resolved_token = token
+            if wait:
+                self._wait_until_ready(token)
+            self._client = ServiceClient(**self._client_options(token))
+            return self._client
+        except BaseException as exc:
+            if self._instance is not None:
+                self._announce_exception(exc, persist_checkpoints=False)
+            clean = self._cleanup(persist_checkpoints=False)
+            if not clean:
+                self._announce_cleanup_failure()
+            raise
+
+    def _remember_instance(self, instance: _PodInstance) -> None:
+        """Retain monitoring details after cleanup for error reports and callers."""
+
+        self._last_container_id = instance.container_id or None
+        management_url = getattr(instance, "management_url", "").strip()
+        self._last_dashboard_url = management_url or None
+
+    def _operator_command(self, *arguments: str) -> str:
+        command = [self.provider]
+        if self.profile is not None:
+            command.extend(["--context", self.profile])
+        command.extend(arguments)
+        return shlex.join(command)
+
+    def _announce_pod(self) -> None:
+        """Print the live monitoring handoff before waiting for model readiness."""
+
+        if not self.show_dashboard_link:
+            return
+        container_id = self.container_id
+        lines = [f"OpenTinker Pod created: {container_id or 'unknown'}"]
+        if self.dashboard_url is not None:
+            lines.append(f"  dashboard: {self.dashboard_url}")
+        elif container_id is not None:
+            lines.append(
+                "  dashboard: provider did not return a direct link; find the Pod with "
+                f"`{self._operator_command('container', 'list')}`"
+            )
+        if container_id is not None:
+            lines.append(
+                f"  attach:    {self._operator_command('container', 'attach', container_id)}"
+            )
+        lines.extend(
+            (
+                f"  app:       {self.app}",
+                "  Ctrl+C stops the training loop, flushes completed checkpoints, and "
+                "terminates this Pod.",
+            )
+        )
+        print("\n".join(lines), file=sys.stderr, flush=True)
+
+    def _announce_exception(self, exc: BaseException, *, persist_checkpoints: bool) -> None:
+        if not self.show_dashboard_link:
+            return
+        reason = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+        lines = [f"OpenTinker training {reason}; cleaning up Pod {self.container_id or 'unknown'}."]
+        if self.dashboard_url is not None:
+            lines.append(f"  dashboard: {self.dashboard_url}")
+        if persist_checkpoints:
+            lines.append("  Completed checkpoints will be flushed before the Pod is terminated.")
+        else:
+            lines.append("  The partially started Pod will be terminated.")
+        print("\n".join(lines), file=sys.stderr, flush=True)
+
+    def _announce_cleanup_failure(self) -> None:
+        if not self.show_dashboard_link:
+            return
+        lines = ["OpenTinker cleanup was incomplete; inspect the remote resources manually."]
+        if self.dashboard_url is not None:
+            lines.append(f"  dashboard: {self.dashboard_url}")
+        if self.container_id is not None:
+            lines.append(
+                f"  stop Pod:  {self._operator_command('container', 'stop', self.container_id)}"
+            )
+        if self._reserved_pool is not None:
+            lines.append(
+                "  release:   "
+                f"{self._operator_command('machine', 'release', '--pool', self._reserved_pool, '--yes')}"
+            )
+        print("\n".join(lines), file=sys.stderr, flush=True)
+
+    def _pod_options(self, image: Any, primary_volume: Any) -> dict[str, Any]:
+        options: dict[str, Any] = {
             "app": self.app,
             "name": self.name,
             "entrypoint": self._entrypoint(),
             "ports": [self.port],
             "cpu": self.cpu,
             "memory": self.memory,
-            "gpu": self.gpu if isinstance(self.gpu, str) else list(self.gpu),
+            "gpu": self.gpu if isinstance(self.gpu, str) else list(self.gpu or ()),
             "gpu_count": self.gpu_count,
             "image": image,
             "volumes": [primary_volume, *self.volumes],
             "secrets": list(self.secrets),
-            "env": {
-                "OPENTINKER_BASE_MODEL": self.base_model,
-                "OPENTINKER_CHECKPOINT_ROOT": f"{self.volume_mount_path}/checkpoints",
-                "OPENTINKER_VOLUME_NAME": self.volume_name,
-                "OPENTINKER_MAX_LENGTH": str(self.max_length),
-                "OPENTINKER_PORT": str(self.port),
-                "OPENTINKER_SAMPLING_GPU": "1" if self.sampling_gpu else "0",
-                "OPENTINKER_TRUST_REMOTE_CODE": "1" if self.trust_remote_code else "0",
-                **dict(self.env),
-            },
+            "env": self._server_environment(),
             "keep_warm_seconds": self.keep_warm_seconds,
             "authorized": self.authorized,
             "allow_marketplace": self.allow_marketplace,
         }
         if self.pool is not None:
-            pod_options["pool"] = self.pool
-        try:
-            pod = provider.Pod(**pod_options)
-        except BaseException:
-            self._release_reserved_machine()
-            raise
-        try:
-            instance = cast(_PodInstance, pod.create())
-        except BaseException:
-            self._release_reserved_machine()
-            raise
-        if not instance.ok:
-            self._release_reserved_machine()
-            raise RuntimeError(f"failed to create Beam/Beta9 Pod: {instance.error_msg}")
-        if not instance.url:
-            instance.terminate()
-            self._release_reserved_machine()
-            raise RuntimeError("Beam/Beta9 created the Pod but returned no endpoint URL")
-        self._instance = instance
-        token = self._resolve_access_token(pod)
-        if self.authorized and not token:
-            self.stop()
-            raise RuntimeError(
-                "authorized=True requires a Beam/Beta9 token; configure the selected profile "
-                "or pass access_token"
-            )
-        self._resolved_token = token
-        if wait:
-            try:
-                self._wait_until_ready(token)
-            except BaseException:
-                self.stop()
-                raise
-        options = self._client_options(token)
-        try:
-            self._client = ServiceClient(**options)
-        except BaseException:
-            self.stop()
-            raise
-        return self._client
+            options["pool"] = self.pool
+        return options
+
+    def _server_environment(self) -> dict[str, str]:
+        return {
+            "OPENTINKER_BASE_MODEL": self.base_model,
+            # Beta9 exposes SDK Volumes under /volumes/<mount-name>.
+            "OPENTINKER_CHECKPOINT_ROOT": (
+                f"/volumes/{self.volume_mount_path.strip('/')}/checkpoints"
+            ),
+            "OPENTINKER_VOLUME_NAME": self.volume_name,
+            "OPENTINKER_VOLUME_SYNC_SECONDS": str(self.volume_sync_seconds),
+            "OPENTINKER_MAX_LENGTH": str(self.max_length),
+            "OPENTINKER_PORT": str(self.port),
+            "OPENTINKER_SAMPLING_GPU": "1" if self.sampling_gpu else "0",
+            "OPENTINKER_TRUST_REMOTE_CODE": "1" if self.trust_remote_code else "0",
+            **dict(self.env),
+        }
 
     def stop(self) -> bool:
         """Close the Tinker client and terminate the adapter-created Pod."""
 
-        self._restore_tinker_service_client()
-        if self._client is not None:
-            self._close_client(self._client)
-            self._client = None
-        terminated = True
+        return self._cleanup(persist_checkpoints=True)
+
+    def _cleanup(self, *, persist_checkpoints: bool) -> bool:
+        """Release every owned resource, including after a partial startup."""
+
+        clean = True
         try:
-            if self._instance is not None:
-                instance = self._instance
-                self._instance = None
-                terminated = instance.terminate()
-        finally:
-            self._resolved_token = None
-            released = self._release_reserved_machine()
-        return terminated and released
+            self._restore_tinker_service_client()
+        except Exception:
+            logger.exception("Could not restore Tinker's ServiceClient")
+            clean = False
+
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                self._close_client(client)
+            except Exception:
+                logger.exception("Could not close the Tinker client")
+                clean = False
+
+        instance, self._instance = self._instance, None
+        if instance is not None:
+            if persist_checkpoints:
+                checkpoints = self._get_checkpoint_export_plan(instance)
+                if checkpoints:
+                    clean = self._persist_volume_checkpoints(instance, checkpoints) and clean
+            try:
+                clean = instance.terminate() and clean
+            except Exception:
+                logger.exception("Could not terminate the Beam/Beta9 Pod")
+                clean = False
+
+        self._resolved_token = None
+        try:
+            clean = self._release_reserved_machine() and clean
+        except Exception:
+            logger.exception("Could not release the on-demand Beam/Beta9 machine")
+            clean = False
+        return clean
+
+    def _get_checkpoint_export_plan(self, instance: _PodInstance) -> list[dict[str, str]]:
+        """Get the live service's checkpoint export plan before shutdown."""
+
+        if self.volume_sync_seconds == 0:
+            return []
+        headers = (
+            {"Authorization": f"Bearer {self._resolved_token}"} if self._resolved_token else {}
+        )
+        url = f"{_normalize_url(instance.url)}/opentinker/prepare-shutdown"
+        try:
+            response = httpx.post(url, headers=headers, timeout=10)
+            response.raise_for_status()
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
+            logger.warning("Could not prepare Beam Volume for shutdown: %s", exc)
+            return []
+        payload = response.json()
+        checkpoints = payload.get("checkpoints", [])
+        if not isinstance(checkpoints, list):
+            return []
+        return [
+            {"uri": str(item["uri"]), "volume_path": str(item["volume_path"])}
+            for item in checkpoints
+            if isinstance(item, dict)
+            and isinstance(item.get("uri"), str)
+            and item.get("uri")
+            and isinstance(item.get("volume_path"), str)
+            and item.get("volume_path")
+        ]
+
+    def _persist_volume_checkpoints(
+        self,
+        instance: _PodInstance,
+        checkpoints: Sequence[Mapping[str, str]],
+    ) -> bool:
+        """Upload live checkpoints through Beam when a remote worker mount is local-only."""
+
+        headers = (
+            {"Authorization": f"Bearer {self._resolved_token}"} if self._resolved_token else {}
+        )
+        export_url = f"{_normalize_url(instance.url)}/opentinker/export-checkpoint"
+        volume_paths: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="opentinker-export-") as temporary:
+                staging_root = Path(temporary)
+                for index, checkpoint in enumerate(checkpoints):
+                    uri = checkpoint["uri"]
+                    volume_path = checkpoint["volume_path"]
+                    volume_paths.append(volume_path)
+                    archive_path = staging_root / f"checkpoint-{index}.tar.gz"
+                    with httpx.stream(
+                        "POST",
+                        export_url,
+                        headers=headers,
+                        json={"path": uri},
+                        timeout=httpx.Timeout(600, connect=10),
+                    ) as response:
+                        response.raise_for_status()
+                        with archive_path.open("wb") as archive_file:
+                            for chunk in response.iter_bytes():
+                                archive_file.write(chunk)
+                    extracted = staging_root / f"extracted-{index}"
+                    with tarfile.open(archive_path, "r:gz") as archive:
+                        archive.extractall(extracted, filter="data")
+                    source = extracted / "checkpoint"
+                    if not source.is_dir():
+                        raise RuntimeError(
+                            f"checkpoint export for {uri} had no checkpoint directory"
+                        )
+                    command = self._machine_command(
+                        "cp",
+                        str(source),
+                        f"beam://{volume_path}",
+                    )
+                    interactive = sys.stderr.isatty()
+                    if interactive:
+                        print(
+                            f"Persisting {uri} to beam://{volume_path}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    result = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=not interactive,
+                        text=True,
+                        cwd=temporary,
+                    )
+                    if result.returncode != 0:
+                        detail = (result.stderr or result.stdout).strip()
+                        raise RuntimeError(f"could not upload {uri} to Beam Volume: {detail}")
+            return self._wait_for_published_volume_paths(volume_paths)
+        except Exception as exc:
+            logger.error("Could not persist Beam Volume checkpoints: %s", exc)
+            return False
+
+    def _wait_for_published_volume_paths(self, volume_paths: Sequence[str]) -> bool:
+        """Wait until checkpoint files are visible through Beam's Volume API."""
+
+        try:
+            from beta9.channel import ServiceClient as ProviderServiceClient
+            from beta9.clients.volume import ListPathRequest
+            from beta9.config import get_config_context
+
+            configured_context = (
+                get_config_context(self.profile)
+                if self.profile is not None
+                else get_config_context()
+            )
+            context = self._provider_context or configured_context
+            deadline = time.monotonic() + self.volume_sync_seconds
+            with ProviderServiceClient(config=context) as provider_client:
+                while True:
+                    pending = []
+                    for path in volume_paths:
+                        result = provider_client.volume.list_path(ListPathRequest(path=path))
+                        if not result.ok or not result.path_infos:
+                            pending.append(path)
+                    if not pending:
+                        return True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.error(
+                            "Beam Volume paths were not published before machine release: %s",
+                            ", ".join(pending),
+                        )
+                        return False
+                    time.sleep(min(self.poll_interval, remaining))
+        except Exception as exc:
+            logger.warning("Could not verify Beam Volume publication: %s", exc)
+            return False
 
     @staticmethod
     def _close_client(client: Any) -> None:
@@ -500,7 +766,7 @@ class BeamComputeAdapter:
             raise RuntimeError("failed to reserve an on-demand machine; see Beam's output above")
 
         try:
-            selected_gpu = self._reserved_machine_gpu(pool)
+            selected_gpu = self._pool_gpu(pool)
         except BaseException:
             self._release_reserved_machine()
             raise
@@ -518,7 +784,9 @@ class BeamComputeAdapter:
         self.gpu = selected_gpu
         logger.info("Reserved on-demand Beam pool %s with %s", pool, selected_gpu)
 
-    def _reserved_machine_gpu(self, pool: str) -> str | None:
+    def _pool_gpu(self, pool: str) -> str | None:
+        """Return the single GPU type advertised by a connected machine pool."""
+
         command = self._machine_command(
             "machine",
             "list",
@@ -531,12 +799,12 @@ class BeamComputeAdapter:
         result = subprocess.run(command, check=False, capture_output=True, text=True)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(f"could not inspect reserved Beam pool {pool!r}: {detail}")
+            raise RuntimeError(f"could not inspect Beam/Beta9 pool {pool!r}: {detail}")
         try:
             payload = json.loads(result.stdout)
         except (TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError(
-                "Beam returned invalid JSON while inspecting the reservation"
+                "Beam/Beta9 returned invalid JSON while inspecting the pool"
             ) from exc
         machines = payload.get("machines")
         if not isinstance(machines, list):
@@ -552,7 +820,9 @@ class BeamComputeAdapter:
         if not gpus:
             raise RuntimeError("OpenTinker requires a GPU, but the selected machine is CPU-only")
         if len(gpus) != 1:
-            raise RuntimeError(f"reserved Beam pool {pool!r} contains multiple GPU types")
+            raise RuntimeError(
+                f"Beam/Beta9 pool {pool!r} contains multiple GPU types; pass gpu= explicitly"
+            )
         return gpus.pop()
 
     def _release_reserved_machine(self) -> bool:
@@ -610,7 +880,16 @@ class BeamComputeAdapter:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        self.stop()
+        if exc_value is not None:
+            self._announce_exception(exc_value, persist_checkpoints=True)
+        clean = self.stop()
+        if not clean:
+            self._announce_cleanup_failure()
+        if not clean and exc_type is None:
+            raise RuntimeError(
+                "Beam adapter cleanup did not complete; inspect the logs for checkpoint, "
+                "Pod, or machine-release errors"
+            )
 
 
 __all__ = ["BeamComputeAdapter", "ProviderName"]

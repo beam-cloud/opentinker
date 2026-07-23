@@ -13,11 +13,11 @@ import time
 from typing import Any, cast
 
 from tinker_cookbook import renderers
-from tinker_cookbook.supervised.common import compute_mean_nll
-from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 import opentinker as tinker
+from opentinker._examples import add_compute_arguments, compute_options_from_args, mean_nll
+from opentinker.data import conversation_to_datum
 
 CONVERSATIONS: list[list[dict[str, str]]] = [
     [
@@ -43,29 +43,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--renderer", default="qwen3")
-    parser.add_argument("--provider", choices=("beam", "beta9"), default="beam")
-    parser.add_argument("--profile")
-    parser.add_argument(
-        "--gpu",
-        help="GPU type (default: A10G serverless; omit with --on-demand to browse all)",
-    )
-    parser.add_argument("--pool")
-    parser.add_argument(
-        "--on-demand",
-        action="store_true",
-        help="open Beam's machine picker and release the reservation after training",
-    )
-    parser.add_argument("--machine-ttl", default="1h")
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--max-length", type=int, default=512)
+    add_compute_arguments(parser)
     return parser.parse_args()
-
-
-def mean_nll(result: Any, batch: list[Any]) -> float:
-    logprobs = [item["logprobs"] for item in result.loss_fn_outputs]
-    weights = [datum.loss_fn_inputs["weights"] for datum in batch]
-    return compute_mean_nll(logprobs, weights)
 
 
 def main() -> None:
@@ -78,9 +60,9 @@ def main() -> None:
     batch = [
         conversation_to_datum(
             cast(Any, conversation),
-            renderer,
-            args.max_length,
-            renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+            renderer=renderer,
+            max_length=args.max_length,
+            train_on="last_assistant_message",
         )
         for conversation in CONVERSATIONS
     ]
@@ -88,14 +70,7 @@ def main() -> None:
     checkpoint_name = f"basic-finetune-{int(time.time())}"
     adapter = tinker.BeamComputeAdapter(
         base_model=args.model,
-        provider=args.provider,
-        profile=args.profile,
-        gpu=args.gpu,
-        pool=args.pool,
-        on_demand=args.on_demand,
-        machine_ttl=args.machine_ttl,
-        max_length=args.max_length,
-        sampling_gpu=False,
+        **compute_options_from_args(args),
     )
     with adapter as service_client:
         print(
@@ -152,6 +127,8 @@ def main() -> None:
         "final_nll": final,
         "improved": final < initial,
         "checkpoint": checkpoint,
+        "container_id": adapter.container_id,
+        "dashboard_url": adapter.dashboard_url,
     }
     print(json.dumps(summary, indent=2))
     if not summary["improved"]:

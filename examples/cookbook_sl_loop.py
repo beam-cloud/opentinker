@@ -9,45 +9,25 @@ from tinker_cookbook.recipes.sl_loop import Config
 from tinker_cookbook.recipes.sl_loop import main as cookbook_main
 
 from opentinker import BeamComputeAdapter
+from opentinker._examples import add_compute_arguments, compute_options_from_args
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--provider", choices=("beam", "beta9"), default="beam")
-    parser.add_argument("--profile")
-    parser.add_argument(
-        "--gpu",
-        help="GPU type (default: A10G serverless; omit with --on-demand to browse all)",
-    )
-    parser.add_argument("--pool")
-    parser.add_argument(
-        "--on-demand",
-        action="store_true",
-        help="open Beam's machine picker and release the reservation after training",
-    )
-    parser.add_argument("--machine-ttl", default="1h")
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--volume-name", default="tinker-checkpoints")
     parser.add_argument("--log-path", default="./runs/no-robots")
+    add_compute_arguments(parser)
     args = parser.parse_args()
 
     log_path = Path(args.log_path).resolve()
     log_path.mkdir(parents=True, exist_ok=True)
     adapter = BeamComputeAdapter(
         base_model=args.model,
-        provider=args.provider,
-        profile=args.profile,
-        gpu=args.gpu,
-        pool=args.pool,
-        on_demand=args.on_demand,
-        machine_ttl=args.machine_ttl,
-        volume_name=args.volume_name,
-        sampling_gpu=False,
-        max_length=args.max_length,
+        **compute_options_from_args(args),
     )
     with adapter:
         print(

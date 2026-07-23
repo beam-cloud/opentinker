@@ -8,29 +8,17 @@ from typing import Any, cast
 
 import datasets
 from tinker_cookbook import model_info, renderers
-from tinker_cookbook.supervised.common import compute_mean_nll
-from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from opentinker import BeamComputeAdapter
+from opentinker._examples import add_compute_arguments, compute_options_from_args, mean_nll
+from opentinker.data import conversation_to_datum
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("checkpoint", help="beam:// Volume URI returned by save_state")
+    parser.add_argument("checkpoint", help="tinker:// handle returned by save_state")
     parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--profile")
-    parser.add_argument(
-        "--gpu",
-        help="GPU type (default: A10G serverless; omit with --on-demand to browse all)",
-    )
-    parser.add_argument("--pool")
-    parser.add_argument(
-        "--on-demand",
-        action="store_true",
-        help="open Beam's machine picker and release the reservation after evaluation",
-    )
-    parser.add_argument("--machine-ttl", default="1h")
     parser.add_argument("--examples", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument(
@@ -38,14 +26,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="load through ServiceClient's full state+optimizer resume path",
     )
+    add_compute_arguments(parser)
     return parser.parse_args()
-
-
-def mean_nll(result: Any, batch: list[Any]) -> float:
-    return compute_mean_nll(
-        [item["logprobs"] for item in result.loss_fn_outputs],
-        [datum.loss_fn_inputs["weights"] for datum in batch],
-    )
 
 
 def main() -> None:
@@ -59,22 +41,16 @@ def main() -> None:
     batch = [
         conversation_to_datum(
             cast(dict[str, Any], row)["messages"],
-            renderer,
-            args.max_length,
-            renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+            renderer=renderer,
+            max_length=args.max_length,
+            train_on="all_assistant_messages",
         )
         for row in dataset.select(range(args.examples))
     ]
 
     adapter = BeamComputeAdapter(
         base_model=args.model,
-        profile=args.profile,
-        gpu=args.gpu,
-        pool=args.pool,
-        on_demand=args.on_demand,
-        machine_ttl=args.machine_ttl,
-        sampling_gpu=False,
-        max_length=args.max_length,
+        **compute_options_from_args(args),
     )
     with adapter as service_client:
         if args.resume_with_optimizer:

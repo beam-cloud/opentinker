@@ -1,0 +1,2 @@
+{"prompt":"Production checkout is returning 500 errors for every customer.","teacher_response":"{\"priority\":\"P0\",\"team\":\"payments\",\"action\":\"page_on_call\"}","verified":true}
+{"prompt":"Could we add CSV export to the analytics dashboard next quarter?","teacher_response":"{\"priority\":\"P3\",\"team\":\"analytics\",\"action\":\"create_feature_request\"}","verified":true}
