@@ -1,8 +1,8 @@
-"""A small, real Tinker SFT loop whose GPU work runs on Beam.
+"""A small Tinker SFT loop whose GPU work runs on Beam.
 
 This follows the same public API and datum construction used by
-``tinker_cookbook.recipes.sl_loop``. It deliberately uses a tiny in-memory
-dataset so the example verifies training without downloading a full dataset.
+``tinker_cookbook.recipes.sl_loop``. Its in-memory dataset verifies training
+without downloading a full dataset.
 """
 
 from __future__ import annotations

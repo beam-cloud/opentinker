@@ -1,15 +1,14 @@
 # OpenTinker
 
-OpenTinker is a Beam/Beta9 compute backend for the upstream
-[`tinker`](https://pypi.org/project/tinker/) SDK. Your training code keeps using
-Tinker's `ServiceClient`, `TrainingClient`, datums, futures, renderers, metrics,
-and Cookbook recipes. Model forward/backward, AdamW, LoRA weights, sampling,
-and checkpoint I/O execute in a PyTorch container on a Beam-hosted GPU, a
-temporarily reserved machine, or hardware you attach yourself.
+Use the upstream [`tinker`](https://pypi.org/project/tinker/) SDK with
+infrastructure you control.
 
-This is not a launcher that sends the expensive work back to Tinker's managed
-service. The adapter starts a Tinker-compatible endpoint in a Beam Pod and
-points the ordinary Tinker client at it.
+OpenTinker implements Tinker's HTTP contract inside a Beam Pod. Training code
+keeps its `ServiceClient`, `TrainingClient`, datums, futures, renderers, metrics,
+and Cookbook recipes. A PyTorch/PEFT process handles model forward/backward,
+AdamW, LoRA weights, sampling, and checkpoint I/O on a Beam-hosted GPU, a
+temporary reservation, or hardware you attach yourself. Training traffic ends
+at that Pod; OpenTinker does not forward model work to Tinker's managed service.
 
 ## System overview
 
@@ -36,22 +35,21 @@ flowchart LR
     Volume -- "tinker:// checkpoint handle" --> API
 ```
 
-The local process owns the readable workflow: loading data, choosing batches,
-calling Tinker methods, and reporting metrics. The Beam machine owns expensive
-model compute. The compatibility endpoint translates the normal Tinker HTTP
-contract into local PyTorch/PEFT operations, so Cookbook code does not need a
-second API. Checkpoints outlive the machine in a Beam Volume and can be loaded
-later through their `tinker://` handles.
+The local process loads data, chooses batches, calls Tinker methods, and reports
+metrics. The Beam machine performs the model work. Its compatibility endpoint
+translates the Tinker HTTP contract into PyTorch/PEFT operations, so Cookbook
+code needs no second API. A Beam Volume keeps checkpoints after the machine
+exits, and `tinker://` handles load them again.
 
 See [System diagrams](docs/system-diagrams.md) for separate, annotated
 fine-tuning and distillation flows.
 
-## Monitor every run
+## Monitor and interrupt a run
 
-As soon as Beam creates the Pod—before model download or readiness waits—every
-workflow prints the provider's direct management URL when available, or Beam's
-live Containers dashboard as a fallback. The container ID, app name, and exact
-attach command appear beside it:
+As soon as Beam creates the Pod, before model download or readiness waits, the
+workflow prints the provider's direct management URL. It falls back to Beam's
+live Containers dashboard when no direct URL is available. The container ID,
+app name, and exact attach command appear beside it:
 
 ```text
 OpenTinker Pod created: pod-...
@@ -61,19 +59,17 @@ OpenTinker Pod created: pod-...
   Ctrl+C stops the training loop, flushes completed checkpoints, and terminates this Pod.
 ```
 
-The same values are available as `adapter.dashboard_url` and
-`adapter.container_id`, including after the context exits, so surrounding
-tools can link to the run history. Because the local Tinker loop orchestrates
-each training step, Ctrl+C intentionally ends the run rather than pretending
-it can continue detached. OpenTinker reports the dashboard again, flushes any
-already-created checkpoints to the Volume, terminates the Pod, and releases
-only an on-demand machine it reserved itself. If cleanup is incomplete, it
-prints exact `container stop` and `machine release` recovery commands.
+The values remain available as `adapter.dashboard_url` and
+`adapter.container_id` after the context exits, so other tools can link to the
+run history. The local Tinker loop drives each training step, so Ctrl+C ends the
+run. OpenTinker prints the dashboard again, flushes completed checkpoints to the
+Volume, terminates the Pod, and releases only a reservation it created. Failed
+cleanup prints exact `container stop` and `machine release` recovery commands.
 
-## Why “open” means bring your own GPU
+## Pick the hardware
 
-The Tinker workflow is not coupled to Beam's hosted fleet. All runnable
-examples use the same three hardware choices:
+The same workflow runs on Beam's hosted fleet, marketplace capacity, or your
+own machine:
 
 | What runs the job | Options |
 | --- | --- |
@@ -101,7 +97,7 @@ See [Bring your own hardware](docs/bring-your-own-hardware.md) for the complete
 serverless, `machine reserve`, private-pool installer, and self-hosted Beta9
 flows.
 
-## What you need
+## Install
 
 - Python 3.11 or newer
 - a [Beam](https://beam.cloud) account, or a self-hosted Beta9 cluster
@@ -122,11 +118,11 @@ Plain pip also works:
 python -m pip install -e '.[beam,examples]'
 ```
 
-## Fine-tune a real model on a real dataset
+## Run a Cookbook fine-tune
 
 This command runs the upstream
 [`tinker_cookbook.recipes.sl_loop`](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/recipes/sl_loop.py)
-on `HuggingFaceH4/no_robots`. The recipe downloads the dataset, renders real
+on `HuggingFaceH4/no_robots`. The recipe downloads the dataset, renders
 conversations into Tinker datums, performs LoRA forward/backward and AdamW
 steps on an A10G, logs per-step NLL/BPB metrics, and saves its final state and
 sampler checkpoints to a Beam Volume.
@@ -170,9 +166,9 @@ distillation schemas, custom preprocessing examples, loss-mask choices, and
 the reusable Python helpers. Runnable sample files live in
 [`examples/data/`](examples/data/).
 
-## Distill a tool-planning skill into a smaller model
+## Distill a tool planner
 
-`distill_tool_planner.py` performs real sequence-level distillation on one
+`distill_tool_planner.py` performs sequence-level distillation on one
 Beam GPU. A 4B teacher generates executable six-step analytics plans, a strict
 verifier admits only exact JSON plans with valid tool arguments and `$sN`
 dependencies, and the regular Tinker supervised APIs train a 0.6B student on
@@ -192,7 +188,7 @@ requests. It writes the teacher dataset and full per-case results under
 `runs/tool-planner-distillation/` and fails if distillation does not improve
 the held-out exact-match score.
 
-The durable teacher-data format is deliberately simple:
+Teacher data uses three fields:
 
 ```json
 {"prompt":"...","teacher_response":"...","verified":true}
@@ -217,10 +213,10 @@ fresh-machine checkpoint eval      6/6 exact
 The fresh-machine score came from a second A16 reservation after the training
 Pod and machine had been terminated, using only the persisted sampler handle.
 
-This is prompt/sequence distillation using Tinker sampling, datum, training,
-checkpoint, and sampling-client interfaces. It is not logit/top-k or full
-on-policy distillation; those require protocol operations not yet implemented
-by the single-node backend.
+The example implements prompt/sequence distillation through Tinker's sampling,
+datum, training, checkpoint, and sampling-client interfaces. Logit/top-k and
+full on-policy distillation require protocol operations that the single-node
+backend does not yet implement.
 
 Re-evaluate the returned sampler checkpoint on a newly reserved GPU without
 regenerating teacher data or training:
@@ -231,7 +227,7 @@ uv run python examples/distill_tool_planner.py \
   --checkpoint tinker://<model-id>/sampler_weights/<name>
 ```
 
-## Choose where compute runs
+## Reserve hardware in the training command
 
 Add `--on-demand` without a GPU to open Beam's native hardware picker inside
 the training command:
@@ -262,10 +258,9 @@ without `--on-demand`. Its GPU is discovered automatically, and OpenTinker
 does not release a pool it did not create. To attach your own machine to that
 pool, follow [Bring your own hardware](docs/bring-your-own-hardware.md).
 
-## Use the Cookbook recipe in your own code
+## Wrap a Cookbook recipe
 
-The wrapper is deliberately small. The training loop below is the official
-Cookbook implementation, not a parallel OpenTinker trainer:
+The training loop below is the official Cookbook implementation:
 
 ```python
 from tinker_cookbook.recipes.sl_loop import Config
@@ -307,7 +302,7 @@ with BeamComputeAdapter(
     ...
 ```
 
-## Tinker checkpoint handles, backed by a Beam Volume
+## Save and reload checkpoints
 
 OpenTinker creates or reuses the named `tinker-checkpoints` Volume. Tinker's
 `save_state()` and `save_weights_for_sampler()` return normal Tinker handles:
@@ -371,7 +366,7 @@ uv run python examples/evaluate_checkpoint.py \
   --profile default --gpu A10G --resume-with-optimizer
 ```
 
-## Ordinary Tinker code also works
+## Use a drop-in import
 
 ```python
 import opentinker as tinker
@@ -413,13 +408,13 @@ arbitrary custom loss functions, or the full Tinker account-management REST
 API. The adapter's temporary `tinker.ServiceClient` override is process-global;
 do not run two adapter contexts concurrently in one Python process.
 
-## Why there is an endpoint
+## HTTP compatibility
 
-The upstream Tinker SDK is an HTTP client. Preserving its unmodified clients
-and futures requires a compatibility endpoint between the local workflow and
-the remote GPU. OpenTinker runs that endpoint inside the Beam Pod. Future
-retrieval is long-polled so model downloads and GPU steps do not generate a
-tight `try_again` request loop.
+The upstream Tinker SDK is an HTTP client, so its unmodified clients and futures
+need a compatibility endpoint between the local workflow and the remote GPU.
+OpenTinker runs that endpoint inside the Beam Pod. Long-polling future retrieval
+keeps model downloads and GPU steps from generating a tight `try_again` request
+loop.
 
 See [`examples/`](examples/) for real Cookbook fine-tuning, verified
 teacher-to-student distillation, checkpoint evaluation, and a tiny smoke test.

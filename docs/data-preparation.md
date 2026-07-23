@@ -1,9 +1,8 @@
 # Data preparation
 
-OpenTinker does not invent a second model-input format. You provide readable
-conversation or teacher-output records; the official Tinker Cookbook renderer
-turns them into tokenized `tinker.Datum` objects with target tokens and loss
-weights.
+Start with readable examples; there is no OpenTinker-specific input type. The
+official Tinker Cookbook renderer validates them and creates model-ready
+`tinker.Datum` objects.
 
 For the runtime architecture and annotated training flows, see
 [System diagrams](system-diagrams.md).
@@ -174,7 +173,7 @@ Only the assistant teacher response receives loss. `require_verified=True`
 fails before training if any row is not explicitly marked `verified: true`.
 
 The full [`distill_tool_planner.py`](../examples/distill_tool_planner.py)
-example demonstrates the important production details:
+example keeps these boundaries explicit:
 
 - the teacher receives a detailed schema/tool contract;
 - the smaller student receives only the short instruction and user request;

@@ -1,9 +1,8 @@
 # Examples
 
-For an architectural overview and annotated fine-tuning/distillation flows,
-start with [`docs/system-diagrams.md`](../docs/system-diagrams.md).
+These programs are meant to be run, modified, and used as acceptance tests.
 
-Every example has the same hardware contract:
+They share one hardware contract:
 
 ```text
 no flags              -> Beam serverless A10G
@@ -16,12 +15,14 @@ no flags              -> Beam serverless A10G
 host with `beam pool join`, print an installer for a remote host, or use a
 self-hosted Beta9 pool.
 
-Every run prints a clickable Beam/Beta9 dashboard URL immediately after Pod
-creation, before the model is ready. It also prints the container ID and the
-exact `container attach` command for terminal monitoring. Ctrl+C cleanly stops
-the local Tinker loop, flushes completed checkpoints, terminates the Pod, and
-releases adapter-owned on-demand hardware; user-owned `--pool` capacity stays
-attached.
+For an architectural overview and annotated fine-tuning/distillation flows,
+see [`docs/system-diagrams.md`](../docs/system-diagrams.md).
+
+Each run prints a clickable Beam/Beta9 dashboard URL immediately after Pod
+creation, before the model is ready. The run also prints its container ID and
+exact `container attach` command. Ctrl+C stops the local Tinker loop, flushes
+completed checkpoints, terminates the Pod, and releases adapter-owned
+on-demand hardware; user-owned `--pool` capacity stays attached.
 
 ## Fine-tune your own JSONL
 
@@ -48,11 +49,11 @@ For a nonstandard input schema, load or map records in Python and call
 [`docs/data-preparation.md`](../docs/data-preparation.md) for SFT, multi-turn,
 and distillation examples.
 
-## Real supervised fine-tuning
+## Cookbook supervised fine-tuning
 
-`cookbook_sl_loop.py` runs the official Tinker Cookbook supervised loop on the
-real `HuggingFaceH4/no_robots` dataset. This is the practical example and the
-production acceptance test for OpenTinker.
+`cookbook_sl_loop.py` runs the official Tinker Cookbook supervised loop on
+`HuggingFaceH4/no_robots`. It also serves as OpenTinker's production acceptance
+test.
 
 ```bash
 uv run python examples/cookbook_sl_loop.py \
@@ -116,8 +117,8 @@ command to skip training and verify a saved student on a newly reserved GPU.
 
 ## Fast smoke test
 
-`basic_finetune.py` is intentionally tiny. It is useful for checking account,
-image, endpoint, GPU, and Tinker protocol setup, but it is not presented as a
+`basic_finetune.py` checks account, image, endpoint, GPU, and Tinker protocol
+setup with a tiny in-memory dataset. Use the Cookbook or JSONL examples for a
 meaningful model fine-tune.
 
 ```bash

@@ -1,18 +1,17 @@
 # Bring your own hardware
 
-OpenTinker is open at the compute boundary. The same Tinker training program
-can use Beam's serverless fleet, temporarily reserved marketplace hardware, or
-a GPU machine that you attach to a private Beam/Beta9 pool.
+OpenTinker separates the training API from the equipment that executes it.
 
-The runtime contract stays the same in every case:
+Run the same Tinker program on Beam's serverless fleet, a temporary marketplace
+reservation, or a GPU attached to a private Beam/Beta9 pool:
 
 ```text
 your Tinker workflow -> BeamComputeAdapter -> named compute pool -> your GPU
 ```
 
-OpenTinker builds the training image, starts the compatible Tinker endpoint on
-the selected pool, and keeps checkpoints in the configured Beam Volume. Moving
-between hardware sources changes only the adapter's hardware options.
+OpenTinker builds the image, starts the compatible endpoint on the selected
+pool, and writes checkpoints to the configured Beam Volume. Only the adapter's
+hardware options change between sources.
 
 ## The three hardware paths
 
@@ -103,7 +102,7 @@ uv run python examples/finetune_jsonl.py ./my-data.jsonl \
   --profile default --pool opentinker-gpus
 ```
 
-The equivalent Python is intentionally small:
+Python uses the same `pool` option:
 
 ```python
 import opentinker as tinker
@@ -139,7 +138,7 @@ See the [Beta9 project](https://github.com/beam-cloud/beta9) and its current
 [`pool create`, `pool join`, and installer implementation](https://github.com/beam-cloud/beta9/blob/main/sdk/src/beta9/cli/pool.py)
 for cluster-side setup and advanced agent controls.
 
-## Operational rules that keep the DX predictable
+## Resource ownership
 
 - `--on-demand` means OpenTinker owns the reservation and releases it.
 - `--pool` means you own the pool; OpenTinker never deletes or releases it.
@@ -149,8 +148,8 @@ for cluster-side setup and advanced agent controls.
   `--gpu`.
 - Checkpoints use the same Beam Volume regardless of where the GPU lives.
 
-This separation is the important part: Tinker owns the workflow API, Beam or
-Beta9 owns scheduling, and you decide who owns the physical GPU.
+Tinker supplies the workflow API, Beam or Beta9 schedules the job, and the
+selected pool determines who owns the physical GPU.
 
 ## Monitoring and interruption
 

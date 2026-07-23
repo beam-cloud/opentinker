@@ -2,9 +2,8 @@
 
 """Remote OpenTinker server composition root.
 
-Protocol routing and GPU execution live in separate modules so each can be
-tested without booting the other. This module intentionally remains executable
-with ``python -m opentinker._server``.
+Protocol routing and GPU execution live in separate modules for independent
+tests. Run this module with ``python -m opentinker._server``.
 """
 
 from __future__ import annotations

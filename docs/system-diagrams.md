@@ -1,8 +1,6 @@
 # System diagrams
 
-OpenTinker keeps the Tinker workflow and moves model compute onto a Beam or
-Beta9 GPU. The diagrams below separate orchestration, model execution, durable
-storage, and verification so it is clear which component does what.
+The diagrams place each operation next to the component that owns it.
 
 ## The shared system
 
@@ -53,20 +51,20 @@ flowchart LR
   which examples form a batch and when to train, evaluate, sample, or save.
 - **`BeamComputeAdapter`** builds the image, defaults to serverless capacity,
   opens Beam's hardware picker when requested, or targets your existing pool.
-  It starts the Pod and returns a normal Tinker `ServiceClient`.
-- **The selected pool** is the stable scheduling boundary. It may contain Beam
+  The adapter starts the Pod and returns a normal Tinker `ServiceClient`.
+- **A selected pool** forms the scheduling boundary. It may contain Beam
   capacity or a machine you attached with `beam pool join`; the Tinker workflow
   above it is identical.
-- **The compatibility endpoint** exists because the upstream Tinker SDK speaks
-  HTTP. It implements the relevant Tinker service contract inside the Pod; it
-  is not a hosted Tinker training endpoint.
-- **The Transformers/PEFT engine** loads the Hugging Face base model and owns
+- **HTTP compatibility** is necessary because the upstream Tinker SDK speaks
+  HTTP. An endpoint inside the Pod implements the relevant Tinker service
+  contract; it is not a hosted Tinker training endpoint.
+- **Transformers/PEFT** loads the Hugging Face base model and owns
   the trainable LoRA adapter, gradients, AdamW state, and generation calls.
-- **The Beam GPU** performs the expensive forward pass, backward pass,
+- **GPU execution** covers the forward pass, backward pass,
   optimizer work, and token generation.
-- **The Beam Volume** stores adapter weights and optimizer state after the Pod
-  exits. `tinker://` is the SDK-facing handle for the corresponding Volume
-  directory.
+- **Durable storage** uses a Beam Volume for adapter weights and optimizer state
+  after the Pod exits. `tinker://` is the SDK-facing handle for the
+  corresponding Volume directory.
 
 See [Bring your own hardware](bring-your-own-hardware.md) for the exact
 serverless, on-demand reservation, private pool, installer, and self-hosted
@@ -117,8 +115,8 @@ flowchart TD
 4. **Train on Beam.** `forward_backward` measures prediction error and computes
    gradients. `optim_step` updates only the LoRA parameters, leaving the base
    model frozen.
-5. **Evaluate.** Before/after NLL on held-out examples answers a simple
-   question: did the tuned model become better at the desired answers?
+5. **Evaluate.** Before/after NLL on held-out examples shows whether the tuned
+   model became better at the desired answers.
 6. **Save two useful artifacts.** A state checkpoint includes optimizer state
    for resuming training. A sampler checkpoint contains what inference needs.
 
@@ -206,6 +204,6 @@ checkpoint evaluation of `6/6`.
 | Training operation | LoRA supervised training | The same LoRA supervised training after teacher-data creation |
 | Final artifact | State and sampler checkpoints | Student state and sampler checkpoints |
 
-The key intuition is that **distillation changes how labels are produced, not
-how the accepted labels are trained**. After verification, both paths converge
-on the same Tinker datum and Beam GPU training loop.
+**Distillation changes how labels are produced, not how accepted labels are
+trained.** After verification, both paths use the same Tinker datum and Beam GPU
+training loop.

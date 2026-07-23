@@ -1,9 +1,8 @@
-"""Small data-preparation helpers for Tinker supervised and distillation workflows.
+"""Data preparation for Tinker supervised and distillation workflows.
 
-The helpers deliberately accept ordinary dictionaries so datasets can come
-from JSONL, Hugging Face Datasets, a database, or an in-memory generator. They
-delegate tokenization and loss-mask construction to the official Tinker
-Cookbook renderer instead of defining a second training-data format.
+The helpers accept ordinary dictionaries from JSONL, Hugging Face Datasets,
+databases, or in-memory generators. The official Tinker Cookbook renderer
+handles tokenization and loss-mask construction.
 """
 
 from __future__ import annotations

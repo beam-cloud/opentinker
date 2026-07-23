@@ -284,7 +284,7 @@ class TransformersEngine:
                             or advantages.shape != logprobs.shape
                         ):
                             raise ValueError(
-                                "logprobs and advantages must align with target_tokens"
+                                "logprobs and advantages must match target_tokens length"
                             )
                         per_token_loss = -(torch.exp(logprobs - old_logprobs) * advantages)
                     denominator = weights.sum().clamp_min(1.0)

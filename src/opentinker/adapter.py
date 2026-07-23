@@ -76,8 +76,8 @@ class BeamComputeAdapter:
     discovers its GPU type automatically. A concrete ``gpu`` remains useful
     for filtering offers or validating a heterogeneous environment.
 
-    The first implementation is intentionally single-node. One GPU trains a
-    PEFT LoRA adapter; sampling can share it or use a second GPU.
+    The backend is single-node. One GPU trains a PEFT LoRA adapter; sampling
+    can share it or use a second GPU.
     """
 
     base_model: str
@@ -664,9 +664,8 @@ class BeamComputeAdapter:
         if any(character in self.base_image for character in "\r\n"):
             raise ValueError("base_image must not contain newlines")
 
-        # Beam/Beta9 deliberately skips source sync for custom images. Embed the
-        # small server package into the image so an installed OpenTinker wheel is
-        # sufficient to launch a Pod; no repository checkout is needed remotely.
+        # Custom Beam/Beta9 images skip source sync. Embed the server package so
+        # an installed OpenTinker wheel can launch a Pod without a remote checkout.
         package_source = Path(__file__).parent
         with tempfile.TemporaryDirectory(prefix="opentinker-image-") as temp_directory:
             context = Path(temp_directory)

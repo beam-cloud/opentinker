@@ -1,7 +1,7 @@
 """Shared command-line plumbing for the runnable examples.
 
-The helpers here stop at the infrastructure boundary. Training remains plain
-Tinker code in each example so the important workflow is never hidden.
+These helpers cover infrastructure options only. Each example keeps its Tinker
+training loop inline.
 """
 
 from __future__ import annotations
