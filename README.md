@@ -1,14 +1,58 @@
 # OpenTinker
 
-Run existing [Tinker](https://github.com/thinking-machines-lab/tinker) training
-code on GPUs managed by [Beam](https://beam.cloud) or a self-hosted Beta9
-cluster.
+Run [Tinker](https://github.com/thinking-machines-lab/tinker) training
+code on your own cloud, or GPUs managed by [Beam](https://beam.cloud).
+
+---
+
+## Quickstart
+
+1. Signup for [Beam](https://beam.cloud)
+2. `uv add "opentinker[beam] @ git+https://github.com/beam-cloud/opentinker.git"`
+3. `uv run beam login`
+4. Wrap the Tinker workflow in `BeamComputeAdapter`
+
+
+```python
+from opentinker import BeamComputeAdapter
+
+async def main():
+    with BeamComputeAdapter(
+        base_model=config.model_name,
+        profile="default",
+        gpu="A10G",
+    ):
+        await train.main(config)  # Your existing Tinker workflow.
+```
+
+## Hardware Options
+
+The same options work in `BeamComputeAdapter(...)` and notebook `start(...)`:
+
+| Arguments | Result |
+| --- | --- |
+| `gpu="A10G"` | Beam serverless A10G |
+| `on_demand=True` | Open Beam's interactive machine picker |
+| `on_demand=True, gpu="H100", gpu_count=4` | Reserve a matching 4-GPU machine |
+| `pool="my-gpus"` | Use hardware you reserved, attached, or self-host |
+
+Add `interconnect="nvlink"` when every requested GPU must have NVLink or
+NVSwitch connectivity. OpenTinker uses single-node PyTorch DDP for
+`gpu_count > 1`. See
+[Bring your own hardware](docs/bring-your-own-hardware.md) for private pools
+and self-hosted [Beta9](https://github.com/beam-cloud/beta9).
+
+With `on_demand=True`, Beam's picker appears in the terminal that launched
+Marimo. Supplying `gpu="H100"` filters that picker; it does not move the picker
+into the notebook.
+
+---
 
 Your `tinker` imports, `ServiceClient` calls, training loop, data, losses,
 renderers, futures, and `tinker://...` checkpoint handles stay the same.
 OpenTinker adds the compute backend around that code.
 
-You need Beam credentials (or a configured self-hosted Beta9 cluster), not a
+You need Beam credentials, not a
 Tinker account or `TINKER_API_KEY`. Model forward/backward, optimization, and
 sampling run on the GPU you select; default `tinker.ServiceClient()` calls do
 not send model requests to Tinker's hosted service.
@@ -213,27 +257,6 @@ starts a separate workflow. See
 [Cookbook notebooks on Beam](docs/cookbook-notebooks.md) for other tutorials,
 on-demand hardware, private pools, cancellation, and the tested compatibility
 matrix.
-
-## Choose hardware
-
-The same options work in `BeamComputeAdapter(...)` and notebook `start(...)`:
-
-| Arguments | Result |
-| --- | --- |
-| `gpu="A10G"` | Beam serverless A10G |
-| `on_demand=True` | Open Beam's interactive machine picker |
-| `on_demand=True, gpu="H100", gpu_count=4` | Reserve a matching 4-GPU machine |
-| `pool="my-gpus"` | Use hardware you reserved, attached, or self-host |
-
-Add `interconnect="nvlink"` when every requested GPU must have NVLink or
-NVSwitch connectivity. OpenTinker uses single-node PyTorch DDP for
-`gpu_count > 1`. See
-[Bring your own hardware](docs/bring-your-own-hardware.md) for private pools
-and self-hosted Beta9.
-
-With `on_demand=True`, Beam's picker appears in the terminal that launched
-Marimo. Supplying `gpu="H100"` filters that picker; it does not move the picker
-into the notebook.
 
 ## Checkpoints and task lifetime
 
